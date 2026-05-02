@@ -1,0 +1,30 @@
+{
+  "project_info": {
+    "project_number": "512977347025",
+    "firebase_url": "https://uasdmain-default-rtdb.firebaseio.com",
+    "project_id": "uasdmain",
+    "storage_bucket": "uasdmain.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:512977347025:android:be380244b7fedfd3c940f0",
+        "android_client_info": {
+          "package_name": "com.uasd.main"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBfza_pv6_2rO6okLVlrooUAWC_44uUm5g"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

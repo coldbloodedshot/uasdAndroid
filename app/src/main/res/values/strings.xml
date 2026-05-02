@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">Uasd Docente</string>
+    <string name="title_dashboard">Mis Secciones</string>
+    <string name="no_sections">No hay secciones registradas. Usa la extensión para extraerlas.</string>
+</resources>
