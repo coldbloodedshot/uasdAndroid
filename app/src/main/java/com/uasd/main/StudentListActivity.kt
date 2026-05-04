@@ -25,6 +25,10 @@ import java.net.URL
 import org.json.JSONObject
 import java.io.OutputStreamWriter
 import java.io.File
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
+import android.content.Intent
 
 class StudentListActivity : AppCompatActivity() {
 
@@ -37,6 +41,10 @@ class StudentListActivity : AppCompatActivity() {
     private lateinit var recyclerView: RecyclerView
     private lateinit var spinnerEvaluaciones: Spinner
     private lateinit var etSearch: EditText
+    private lateinit var ivClearSearch: ImageView
+    private lateinit var btnDictado: ImageButton
+    
+    private val savedMatchesThisSession = mutableSetOf<String>() // Para evitar duplicados en onPartialResults
     
     // Speed Dial FABs
     private lateinit var fabMain: com.google.android.material.floatingactionbutton.FloatingActionButton
@@ -55,6 +63,11 @@ class StudentListActivity : AppCompatActivity() {
     private var seccion: String? = null
     private var currentQuery: String = ""
     private var pendingSelectEvalId: String? = null
+    
+    private var speechRecognizer: SpeechRecognizer? = null
+    private var isDictationMode = false
+    private var currentDictationMatchId: String? = null
+    private var currentDictationSuggestedGrade: Double? = null
     
     private val PREFS_NAME = "uasd_prefs"
     private val KEY_LAST_EXTRA = "last_extra_points"
@@ -84,12 +97,21 @@ class StudentListActivity : AppCompatActivity() {
         recyclerView = findViewById(R.id.recyclerViewStudents)
         spinnerEvaluaciones = findViewById(R.id.spinnerEvaluaciones)
         etSearch = findViewById<EditText>(R.id.etSearch)
+        ivClearSearch = findViewById(R.id.ivClearSearch)
+        btnDictado = findViewById(R.id.btnDictado)
 
+        ivClearSearch.setOnClickListener {
+            etSearch.text.clear()
+        }
+
+        btnDictado.setOnClickListener {
+            iniciarFlujoDictado()
+        }
 
         recyclerView.layoutManager = LinearLayoutManager(this)
         recyclerView.addItemDecoration(DividerItemDecoration(this, DividerItemDecoration.VERTICAL))
         
-        adapter = EstudianteAdapter(emptyList(), { alumno ->
+        adapter = EstudianteAdapter(emptyList(), false, { alumno ->
             if (spinnerEvaluaciones.selectedItem?.toString() != ACUMULADO_TEXT) {
                 mostrarDialogoNota(alumno)
             } else {
@@ -97,6 +119,8 @@ class StudentListActivity : AppCompatActivity() {
             }
         }, { alumno ->
             mostrarDialogoObservacion(alumno)
+        }, { alumno, grade ->
+            guardarNotaDictado(alumno, grade)
         })
         recyclerView.adapter = adapter
 
@@ -153,6 +177,7 @@ class StudentListActivity : AppCompatActivity() {
                 override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
                 override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
                     currentQuery = s?.toString() ?: ""
+                    ivClearSearch.visibility = if (currentQuery.isEmpty()) View.GONE else View.VISIBLE
                     actualizarLista()
                 }
                 override fun afterTextChanged(s: android.text.Editable?) {}
@@ -164,8 +189,29 @@ class StudentListActivity : AppCompatActivity() {
     }
 
     override fun onSupportNavigateUp(): Boolean {
+        if (isDictationMode && currentDictationMatchId != null) {
+            currentDictationMatchId = null
+            currentDictationSuggestedGrade = null
+            actualizarLista()
+            return true
+        } else if (isDictationMode) {
+            detenerDictado()
+            return true
+        }
         finish()
         return true
+    }
+
+    override fun onBackPressed() {
+        if (isDictationMode && currentDictationMatchId != null) {
+            currentDictationMatchId = null
+            currentDictationSuggestedGrade = null
+            actualizarLista()
+        } else if (isDictationMode) {
+            detenerDictado()
+        } else {
+            super.onBackPressed()
+        }
     }
 
     private fun cargarDatos() {
@@ -266,7 +312,7 @@ class StudentListActivity : AppCompatActivity() {
         } else {
             listaAlumnosOriginal.filter { 
                 it.nombre.contains(currentQuery, ignoreCase = true) || 
-                it.matricula.contains(currentQuery, ignoreCase = true)
+                it.matricula.contains(currentQuery)
             }
         }
 
@@ -290,7 +336,8 @@ class StudentListActivity : AppCompatActivity() {
             
             alumnosFiltrados.forEach { est ->
                 val nota = notasActuales[est.matricula] ?: -1.0 // -1 significa sin nota
-                listaMostrable.add(GradableEstudiante(est.matricula, est.nombre, nota, false, observacionesMap[est.matricula]))
+                val gradable = GradableEstudiante(est.matricula, est.nombre, nota, false, observacionesMap[est.matricula])
+                listaMostrable.add(gradable)
             }
         }
         
@@ -437,12 +484,19 @@ class StudentListActivity : AppCompatActivity() {
             builder.setMessage("Puntos actuales: $notaActual")
         } else {
             builder.setPositiveButton("Guardar") { _, _ ->
-                val nota = etNota.text.toString().toDoubleOrNull() ?: 0.0
-                if (nota <= evalActual.valor) {
-                    database.child("seccion_detalles").child(nrc!!)
-                        .child("notas").child(evalActual.id).child(alumno.matricula).setValue(nota)
+                val input = etNota.text.toString().trim()
+                val ref = database.child("seccion_detalles").child(nrc!!)
+                        .child("notas").child(evalActual.id).child(alumno.matricula)
+                
+                if (input.isEmpty()) {
+                    ref.removeValue()
                 } else {
-                    Toast.makeText(this, "Error: La nota no puede superar el valor máximo", Toast.LENGTH_SHORT).show()
+                    val nota = input.toDoubleOrNull() ?: 0.0
+                    if (nota <= evalActual.valor) {
+                        ref.setValue(nota)
+                    } else {
+                        Toast.makeText(this, "Error: La nota no puede superar el valor máximo", Toast.LENGTH_SHORT).show()
+                    }
                 }
             }
             builder.setNeutralButton("100 %") { _, _ ->
@@ -579,7 +633,6 @@ class StudentListActivity : AppCompatActivity() {
 
     override fun onPrepareOptionsMenu(menu: android.view.Menu?): Boolean {
         val deleteItem = menu?.findItem(R.id.action_delete_eval)
-        val dictadoItem = menu?.findItem(R.id.action_dictado)
         val statsItem = menu?.findItem(R.id.action_stats)
         
         // Solo mostrar botón "Eliminar", "Dictado" y "Estadísticas" si NO estamos en "Acumulado Total"
@@ -587,7 +640,6 @@ class StudentListActivity : AppCompatActivity() {
         val isNotTotal = (seleccion != ACUMULADO_TEXT && seleccion != null)
         
         deleteItem?.isVisible = isNotTotal
-        dictadoItem?.isVisible = isNotTotal
         statsItem?.isVisible = isNotTotal
         
         return super.onPrepareOptionsMenu(menu)
@@ -597,10 +649,6 @@ class StudentListActivity : AppCompatActivity() {
         return when (item.itemId) {
             R.id.action_delete_eval -> {
                 mostrarDialogoEliminarEvaluacion()
-                true
-            }
-            R.id.action_dictado -> {
-                iniciarFlujoDictado()
                 true
             }
             R.id.action_stats -> {
@@ -624,15 +672,212 @@ class StudentListActivity : AppCompatActivity() {
             return
         }
 
-        AlertDialog.Builder(this)
-            .setTitle("Confirmar Dictado")
-            .setMessage("Vas a grabar y SOBRESCRIBIR notas para la evaluación:\n\n'${seleccion}'\n\n¿Estás seguro de que seleccionaste la correcta?")
-            .setIcon(android.R.drawable.ic_dialog_alert)
-            .setPositiveButton("SÍ, GRABAR") { _, _ ->
-                mostrarDialogoGrabacion()
+        if (isDictationMode) {
+            detenerDictado()
+        } else {
+            empezarDictado()
+        }
+    }
+
+    private fun empezarDictado() {
+        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+            Toast.makeText(this, "El reconocimiento de voz no está disponible o requiere configuración en tu dispositivo.", Toast.LENGTH_LONG).show()
+            Log.e("DictadoVivo", "SpeechRecognizer no está disponible en el dispositivo.")
+            return
+        }
+
+        isDictationMode = true
+        adapter.isDictationMode = true
+        supportActionBar?.title = "DICTADO EN VIVO (Escuchando...)"
+        btnDictado.setColorFilter(android.graphics.Color.RED) // Cambiar a rojo cuando está activo
+        
+        speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this)
+        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, "es-DO")
+            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+        }
+        
+        speechRecognizer?.setRecognitionListener(object : RecognitionListener {
+            override fun onReadyForSpeech(params: Bundle?) {
+                Log.d("DictadoVivo", "onReadyForSpeech")
+                savedMatchesThisSession.clear()
             }
-            .setNegativeButton("Cancelar", null)
-            .show()
+            override fun onBeginningOfSpeech() {
+                Log.d("DictadoVivo", "onBeginningOfSpeech")
+            }
+            override fun onRmsChanged(rmsdB: Float) {}
+            override fun onBufferReceived(buffer: ByteArray?) {}
+            override fun onEndOfSpeech() {
+                Log.d("DictadoVivo", "onEndOfSpeech")
+            }
+            
+            override fun onError(error: Int) {
+                Log.e("DictadoVivo", "onError code: $error")
+                if (isDictationMode) {
+                    // Si hubo un error (ej. silencio), reiniciar el escucha para que sea continuo
+                    speechRecognizer?.startListening(intent)
+                }
+            }
+            
+            override fun onResults(results: Bundle?) {
+                val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                Log.d("DictadoVivo", "onResults matches: $matches")
+                if (!matches.isNullOrEmpty()) {
+                    val texto = matches[0]
+                    // Solo procesamos si el texto termina en un número (calificación o matrícula con nota)
+                    if (Regex(".*\\b\\d+([.,]\\d+)?\\s*$").matches(texto)) {
+                        procesarTextoDictado(texto)
+                    }
+                }
+                if (isDictationMode) {
+                    speechRecognizer?.startListening(intent)
+                }
+            }
+            
+            override fun onPartialResults(partialResults: Bundle?) {
+                val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                if (!matches.isNullOrEmpty()) {
+                    val texto = matches[0]
+                    Log.d("DictadoVivo", "onPartialResults: $texto")
+                    // Solo procesamos si el texto actual termina en un número
+                    if (Regex(".*\\b\\d+([.,]\\d+)?\\s*$").matches(texto)) {
+                        procesarTextoDictado(texto)
+                    }
+                }
+            }
+            
+            override fun onEvent(eventType: Int, params: Bundle?) {}
+        })
+        
+        speechRecognizer?.startListening(intent)
+        actualizarLista()
+        Toast.makeText(this, "Modo dictado activado. Habla el nombre del estudiante.", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun detenerDictado() {
+        isDictationMode = false
+        adapter.isDictationMode = false
+        val nombreMat = intent.getStringExtra("MATERIA")
+        supportActionBar?.title = nombreMat ?: "Lista de Estudiantes"
+        btnDictado.clearColorFilter() // Volver al color original
+        
+        speechRecognizer?.stopListening()
+        speechRecognizer?.destroy()
+        speechRecognizer = null
+        
+        currentDictationMatchId = null
+        currentDictationSuggestedGrade = null
+        actualizarLista()
+        Toast.makeText(this, "Modo dictado desactivado", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun procesarTextoDictado(texto: String) {
+        if (texto.isEmpty()) return
+        
+        // Regex para extraer múltiples bloques de [Nombre/ID] [Nota]
+        // [^\d]+ -> Cualquier cosa que no sea número (Nombres)
+        // | \d{7,10} -> O números largos (Matrículas)
+        // \s+ -> Espacio
+        // \d{1,3} -> Número corto (Calificación)
+        val blockRegex = Regex("([^\\d]+|[\\d]{7,10})\\s+\\b(\\d{1,3}([.,]\\d+)?)\\b")
+        val matches = blockRegex.findAll(texto)
+        
+        for (m in matches) {
+            val query = m.groupValues[1].trim()
+            val numStr = m.groupValues[2].replace(',', '.')
+            val grade = numStr.toDoubleOrNull() ?: continue
+            
+            if (query.isEmpty()) continue
+
+            // Buscar el estudiante
+            val namesList = listaAlumnosOriginal.map { it.nombre }
+            val matchResult = FuzzyMatcher.findBestMatch(query, namesList, "name")
+            
+            val idsList = listaAlumnosOriginal.map { it.matricula }
+            val idMatchResult = FuzzyMatcher.findBestMatch(query, idsList, "id")
+            
+            var bestStudentId: String? = null
+            var bestScore = 0.0
+
+            if (matchResult != null && matchResult.nivelCoincidencia >= 0.4 && matchResult.nivelDiscriminacion >= 0.2) {
+                bestStudentId = listaAlumnosOriginal[matchResult.index].matricula
+                bestScore = matchResult.nivelCoincidencia
+            }
+
+            if (idMatchResult != null && idMatchResult.nivelCoincidencia >= 0.4 && idMatchResult.nivelDiscriminacion >= 0.2) {
+                if (idMatchResult.nivelCoincidencia > bestScore) {
+                    bestStudentId = listaAlumnosOriginal[idMatchResult.index].matricula
+                }
+            }
+
+            if (bestStudentId != null) {
+                // Evitar procesar el mismo bloque (estudiante + nota) varias veces en la misma sesión de habla
+                val sessionKey = "${bestStudentId}_${grade}"
+                if (!savedMatchesThisSession.contains(sessionKey)) {
+                    val studentObj = listaAlumnosOriginal.find { it.matricula == bestStudentId }
+                    if (studentObj != null) {
+                        Log.d("DictadoVivo", "Bloque detectado: $query -> $grade. Auto-guardando: $bestStudentId")
+                        val gradable = GradableEstudiante(studentObj.matricula, studentObj.nombre, 0.0, false, null)
+                        guardarNotaDictado(gradable, grade)
+                        resaltarYDesplazarHacia(bestStudentId)
+                        savedMatchesThisSession.add(sessionKey)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun resaltarYDesplazarHacia(matricula: String) {
+        val posicion = adapter.estudiantes.indexOfFirst { it.matricula == matricula }
+        if (posicion != -1) {
+            recyclerView.smoothScrollToPosition(posicion)
+            adapter.highlightedStudentId = matricula
+            adapter.notifyItemChanged(posicion)
+            
+            kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main).launch {
+                kotlinx.coroutines.delay(1500)
+                if (adapter.highlightedStudentId == matricula) {
+                    adapter.highlightedStudentId = null
+                    adapter.notifyItemChanged(posicion)
+                }
+            }
+        }
+    }
+
+    private fun guardarNotaDictado(alumno: GradableEstudiante, nota: Double?) {
+        val seleccion = spinnerEvaluaciones.selectedItem?.toString() ?: return
+        val evalActual = evaluaciones.find { getEvalDisplayName(it) == seleccion } ?: return
+
+        val ref = database.child("seccion_detalles").child(nrc!!)
+            .child("notas").child(evalActual.id).child(alumno.matricula)
+
+        if (nota == null) {
+            ref.removeValue()
+            currentDictationMatchId = null
+            currentDictationSuggestedGrade = null
+            actualizarLista()
+            return
+        }
+
+        val nuevaNota = if (evalActual.esExtra == 1) {
+            val notaActual = todasLasNotas[evalActual.id]?.get(alumno.matricula) ?: 0.0
+            notaActual + nota
+        } else {
+            nota
+        }
+
+        if (evalActual.esExtra == 1 || nuevaNota <= evalActual.valor) {
+            ref.setValue(nuevaNota)
+            val msg = if (evalActual.esExtra == 1) "Puntos sumados a ${alumno.nombre}" else "Nota asignada a ${alumno.nombre}"
+            Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+            
+            currentDictationMatchId = null
+            currentDictationSuggestedGrade = null
+            actualizarLista()
+        } else {
+            Toast.makeText(this, "Error: La nota supera el valor máximo (${evalActual.valor})", Toast.LENGTH_SHORT).show()
+        }
     }
 
     private fun mostrarDialogoGrabacion() {
@@ -836,7 +1081,11 @@ class StudentListActivity : AppCompatActivity() {
 
     private fun toggleFabMenu() {
         if (!::fabMenuContainer.isInitialized) fabMenuContainer = findViewById(R.id.fabMenuContainer)
-        if (isFabOpen) closeFabMenu() else showFabMenu()
+        if (!isFabOpen) {
+            showFabMenu()
+        } else {
+            closeFabMenu()
+        }
     }
 
     private fun showFabMenu() {
@@ -863,11 +1112,12 @@ class StudentListActivity : AppCompatActivity() {
             .alpha(0f)
             .translationY(50f)
             .setDuration(200)
-            .setListener(object : android.animation.AnimatorListenerAdapter() {
-                override fun onAnimationEnd(animation: android.animation.Animator) {
-                    if (!isFabOpen) fabMenuContainer.visibility = View.GONE
-                }
-            })
+            .withEndAction { fabMenuContainer.visibility = View.GONE }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        speechRecognizer?.destroy()
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {

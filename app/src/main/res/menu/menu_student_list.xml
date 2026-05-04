@@ -7,11 +7,7 @@
         android:icon="@android:drawable/ic_menu_delete"
         app:showAsAction="never" />
     
-    <item
-        android:id="@+id/action_dictado"
-        android:title="Dictado de Notas (Audio)"
-        android:icon="@android:drawable/ic_btn_speak_now"
-        app:showAsAction="never" />
+
 
     <item
         android:id="@+id/action_stats"

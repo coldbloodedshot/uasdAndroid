@@ -52,6 +52,30 @@
             android:textColor="@color/purple_500"
             android:visibility="gone"
             android:layout_marginTop="2dp" />
+
+        <LinearLayout
+            android:id="@+id/layoutDictationApproval"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:visibility="gone"
+            android:layout_marginTop="4dp">
+
+            <EditText
+                android:id="@+id/etDictationGrade"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="wrap_content"
+                android:inputType="numberDecimal"
+                android:hint="Nota" />
+
+            <Button
+                android:id="@+id/btnApproveDictation"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Aprobar"
+                style="@style/Widget.AppCompat.Button.Colored" />
+        </LinearLayout>
     </LinearLayout>
 
     <View

@@ -43,7 +43,8 @@ data class GradableEstudiante(
     val nombre: String = "",
     var nota: Double = 0.0,
     var esTotal: Boolean = false, // Para saber si estamos mostrando el acumulado
-    var observacion: String? = null // Texto de la nota adhesiva
+    var observacion: String? = null, // Texto de la nota adhesiva
+    var dictationSuggestedGrade: Double? = null // Nota sugerida por voz
 )
 
 data class SeccionEncuentro(

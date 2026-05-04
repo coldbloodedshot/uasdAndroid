@@ -3,14 +3,21 @@ package com.uasd.main
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import android.widget.Button
+import android.widget.EditText
+import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.recyclerview.widget.RecyclerView
 
 class EstudianteAdapter(
-    private var estudiantes: List<GradableEstudiante>,
+    var estudiantes: List<GradableEstudiante>,
+    var isDictationMode: Boolean = false,
     private val onGradeClick: (GradableEstudiante) -> Unit,
-    private val onNoteClick: (GradableEstudiante) -> Unit
+    private val onNoteClick: (GradableEstudiante) -> Unit,
+    private val onDictationApproveClick: (GradableEstudiante, Double?) -> Unit
 ) : RecyclerView.Adapter<EstudianteAdapter.ViewHolder>() {
+
+    var highlightedStudentId: String? = null
 
     class ViewHolder(view: View) : RecyclerView.ViewHolder(view) {
         val tvMatricula: TextView = view.findViewById(R.id.tvMatricula)
@@ -18,6 +25,9 @@ class EstudianteAdapter(
         val tvNota: TextView = view.findViewById(R.id.tvNota)
         val ivObservacion: android.widget.ImageView = view.findViewById(R.id.ivObservacion)
         val tvObservacionPreview: TextView = view.findViewById(R.id.tvObservacionPreview)
+        val layoutDictationApproval: LinearLayout = view.findViewById(R.id.layoutDictationApproval)
+        val etDictationGrade: EditText = view.findViewById(R.id.etDictationGrade)
+        val btnApproveDictation: Button = view.findViewById(R.id.btnApproveDictation)
     }
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): ViewHolder {
@@ -29,8 +39,10 @@ class EstudianteAdapter(
     override fun onBindViewHolder(holder: ViewHolder, position: Int) {
         val item = estudiantes[position]
         
-        // Zebra stripes
-        val color = if (position % 2 == 0) {
+        // Background coloring with highlight support
+        val color = if (item.matricula == highlightedStudentId) {
+            android.graphics.Color.parseColor("#E0F7FA") // Cyan muy claro para resaltar
+        } else if (position % 2 == 0) {
             androidx.core.content.ContextCompat.getColor(holder.itemView.context, R.color.white)
         } else {
             androidx.core.content.ContextCompat.getColor(holder.itemView.context, R.color.light_gray)
@@ -50,6 +62,9 @@ class EstudianteAdapter(
             holder.tvObservacionPreview.visibility = View.GONE
         }
         holder.ivObservacion.setOnClickListener { onNoteClick(item) }
+
+        // Ocultar layout de dictado (ya no se usa confirmación manual)
+        holder.layoutDictationApproval.visibility = View.GONE
 
         // Displaying grade or special text
         if (item.esTotal) {

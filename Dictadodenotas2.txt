@@ -1,0 +1,1109 @@
+/* 
+DESCRIPCION
+Este es un gscript para transcribir notas. El usuario graba un audio el nombre o la matricula y la nota de cada estudiante.
+Selecciona una worksheet en google drive que contenga un listado con los estudiantes a analizar, y le indica al scrip la evaluacion que
+quiere actualizar. Luego el script se encarga de transcribir y asegurarse de la consistencia de los datos.
+
+CARACTERISTICAS PRINCIPALES
+1) Transcripción Inteligente: Uso de la API de Gemini (v1beta) para convertir audios de dictado en datos JSON estructurados.
+2) Búsqueda Robusta (Fuzzy Matching): Algoritmos que toleran errores en nombres y matrículas, funcionando incluso si el dictado es algo imperfecto.
+3) Flexibilidad Total (Multi-Sheet): El script busca automáticamente en todas las hojas del libro y prioriza la sección actual para máxima velocidad.
+4) Columnas Dinámicas: Puedes elegir qué evaluación actualizar (Primer Parcial, Tarea 1, etc.) simplemente cambiando el nombre en el código.
+5) Auditoría y Debug: Un modo de prueba para no gastar cuota de API y un resumen final detallado con los casos que necesitan revisión manual.
+
+USO VIA POST:
+  El script ahora recibe un POST con los siguientes parámetros:
+  - fileId: ID del archivo de audio en Google Drive
+  - evalColumn: Nombre de la evaluación (columna) a actualizar
+  - nrc: NRC de la sección (usado para obtener el spreadsheet desde Firebase)
+
+// CONFIGURACIÓN
+const FIREBASE_URL = "https://uasdmain-default-rtdb.firebaseio.com";
+
+/**
+ * CONFIGURATION
+ */
+const CONFIG = {
+  // Ahora el script buscará la clave en las Propiedades del Proyecto
+  // para que no se borre cada vez que actualizamos el código.
+  API_KEY: PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY'), 
+  MODEL: 'gemini-2.5-flash',
+  THRESHOLD_COINCIDENCE: 0.4,
+  THRESHOLD_DISCRIMINATION: 0.3, // Mínimo margen entre el 1er y 2do mejor resultado
+  SYSTEM_PROMPT: 'Rol: Eres un Asistente Experto en Transcripción y Auditoría de Datos Académicos',
+  MODO_DEBUG: 0, // 0 = Normal (API), 1 = Debug (Usa datos de abajo)
+  DEBUG_DATA: [
+  {
+    "tipo": 1,
+    "dato": "Juan Arturo Medrano Santos",
+    "nota": 6
+  },
+  {
+    "tipo": 1,
+    "dato": "Abraham Martínez Cruz",
+    "nota": 3
+  },
+  {
+    "tipo": 1,
+    "dato": "Wilmer Araujo de los Santos",
+    "nota": 4
+  },
+  {
+    "tipo": 1,
+    "dato": "Flavio Junior Matos",
+    "nota": 5
+  }
+]
+};
+
+/**
+ * Función POST que recibe los parámetros desde la aplicación Android/Web
+ * Parámetros esperados:
+ * - fileId: ID del archivo de audio en Google Drive
+ * - evalColumn: ID de la evaluación (no el nombre, sino el ID de Firebase)
+ * - nrc: NRC de la sección
+ */
+function doPost(e) {
+  logToDrive("--- INICIO PROCESO POST ---");
+  try {
+    let params = {};
+    
+    // 1. Intentar obtener parámetros de e.parameter (Form posts o Query params)
+    if (e && e.parameter && Object.keys(e.parameter).length > 0) {
+      params = e.parameter;
+      logToDrive("Parámetros detectados en e.parameter: " + JSON.stringify(params));
+    } 
+    
+    // 2. Si no hay datos en parameter, o si queremos complementar con postData (JSON)
+    if (e && e.postData && e.postData.contents && (!params.action && !params.ext_user_username)) {
+      try {
+        const jsonParams = JSON.parse(e.postData.contents);
+        params = Object.assign(params, jsonParams);
+        logToDrive("Parámetros complementados con JSON: " + JSON.stringify(params));
+      } catch (jsonError) {
+        // Si falló el JSON pero ya tenemos datos en e.parameter, lo ignoramos.
+        // Si no tenemos nada, esto causará el error abajo.
+        logToDrive("Nota: postData no es JSON válido o está vacío.");
+      }
+    }
+
+    if (Object.keys(params).length === 0) {
+      logToDrive("ERROR: No se detectaron parámetros en la petición");
+      return ContentService.createTextOutput(JSON.stringify({ 
+        status: "error", 
+        message: "No info" 
+      })).setMimeType(ContentService.MimeType.JSON);
+    }
+
+    const action = params.action || (params.lti_message_type === "basic-lti-launch-request" ? "get_grades" : "record_audio");
+    logToDrive("Acción detectada: " + action);
+
+    if (action === "record_audio") {
+      return handleAudioRecording(params);
+    } else if (action === "get_grades") {
+      return handleGetGrades(params);
+    } else {
+      return ContentService.createTextOutput(JSON.stringify({ 
+        status: "error", 
+        message: "Invalid action: " + action 
+      })).setMimeType(ContentService.MimeType.JSON);
+    }
+
+  } catch (error) {
+    logToDrive("ERROR FATAL: " + error.toString() + "\nStack: " + error.stack);
+    return ContentService.createTextOutput(JSON.stringify({ 
+      status: "error", 
+      message: error.toString(), 
+      stack: error.stack 
+    })).setMimeType(ContentService.MimeType.JSON);
+  }
+}
+
+/**
+ * Procesa la grabación de audio (Lógica original de doPost)
+ */
+function handleAudioRecording(params) {
+  const fileId = params.fileId;
+  const evalId = params.evalColumn; // Este es el ID de la evaluación, no el nombre
+  const nrc = params.nrc;
+
+  if (!fileId || !evalId || !nrc) {
+    logToDrive("ERROR: Faltan datos obligatorios (fileId, evalColumn, nrc)");
+    return ContentService.createTextOutput(JSON.stringify({ 
+      status: "error", 
+      message: "Missing params: fileId, evalColumn, or nrc" 
+    })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // Formatear el identificador de sección (NRC o Código-Sección)
+  const formattedNrc = formatSectionIdentifier(nrc);
+
+  // Ejecutar el proceso principal con Firebase
+  const result = processGradesFromAudioFirebase(formattedNrc, fileId, evalId);
+  
+  logToDrive("--- PROCESO COMPLETADO CON ÉXITO ---");
+  return ContentService.createTextOutput(JSON.stringify({ 
+    status: "success", 
+    message: "Grades processed successfully",
+    result: result
+  })).setMimeType(ContentService.MimeType.JSON);
+}
+
+/**
+ * Obtiene las calificaciones de un estudiante y las muestra en HTML
+ */
+function handleGetGrades(params) {
+  // 1. Extraer la materia del identificador enviado por Moodle
+  const nrcRaw = params.course_section || params.context_label || params.lis_course_section_sourcedid || "";
+  const formattedCode = formatSectionIdentifier(nrcRaw);
+  
+  // Extraer el código de materia (ej. de "FIS2110-06" extrae "FIS2110")
+  const parts = formattedCode.split('-');
+  const subject = parts.length > 1 ? parts.slice(0, -1).join('-') : formattedCode;
+  
+  // Identificar estudiante
+  let matriculaInput = (params.ext_user_username || params.lis_person_sourcedid || "").trim();
+  const fullName = params.lis_person_name_full || "Estudiante";
+  
+  if (!subject || !matriculaInput) {
+    logToDrive(`[ERROR] Faltan parámetros críticos. Materia: ${subject}, Matrícula: ${matriculaInput}`);
+    return HtmlService.createHtmlOutput("<h3>Error: No se pudo identificar la materia o el estudiante.</h3>");
+  }
+
+  // 2. Obtener TODOS los NRCs numéricos asociados a esa materia
+  const nrcList = getNrcsForSubject(subject);
+  
+  logToDrive(`[INFO] Buscando matrícula [${matriculaInput}] en las ${nrcList.length} secciones de [${subject}]`);
+
+  let studentGrades = [];
+  const normalizeId = (id) => String(id || "").replace(/[\s-]/g, "").toLowerCase();
+  const matriculaNorm = normalizeId(matriculaInput);
+
+  try {
+    // 3. Iterar por cada NRC buscando las notas
+    for (const nrc of nrcList) {
+      const gradesUrl = `${FIREBASE_URL}/seccion_detalles/${nrc}/notas.json`;
+      const evaluationsUrl = `${FIREBASE_URL}/seccion_detalles/${nrc}/evaluaciones.json`;
+      
+      const gradesResponse = UrlFetchApp.fetch(gradesUrl, {muteHttpExceptions: true});
+      const evalsResponse = UrlFetchApp.fetch(evaluationsUrl, {muteHttpExceptions: true});
+      
+      if (gradesResponse.getResponseCode() !== 200) continue;
+
+      const gradesData = JSON.parse(gradesResponse.getContentText()) || {};
+      const evalsData = (evalsResponse.getResponseCode() === 200 ? JSON.parse(evalsResponse.getContentText()) : {}) || {};
+
+      // Buscar en cada evaluación de este NRC
+      for (const evalId in gradesData) {
+        const evalVotes = gradesData[evalId];
+        if (evalVotes && typeof evalVotes === 'object') {
+          const foundKey = Object.keys(evalVotes).find(k => normalizeId(k) === matriculaNorm);
+          
+          if (foundKey !== undefined) {
+            const evalName = evalsData[evalId] ? evalsData[evalId].nombre : evalId;
+            studentGrades.push({
+              evaluacion: evalName,
+              nota: evalVotes[foundKey],
+              seccion: nrc // Referencia de en qué NRC se encontró
+            });
+          }
+        }
+      }
+      
+      // Si ya encontramos notas en esta sección, y asumimos que solo está en una, 
+      // podríamos hacer break, pero lo dejamos abierto por si acaso.
+    }
+
+    if (studentGrades.length === 0) {
+      logToDrive(`[DEBUG] No se encontraron notas para ${matriculaInput} en ninguna sección de ${subject}.`);
+    }
+
+    const isTeacher = (params.roles || "").includes("Instructor");
+
+    // 4. Generar HTML
+    let html = `
+      <html>
+        <head>
+          <base target="_top">
+          <style>
+            body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; padding: 20px; color: #333; background-color: #f4f7f6; }
+            .container { max-width: 600px; margin: 0 auto; background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); }
+            h2 { color: #2c3e50; border-bottom: 2px solid #3498db; padding-bottom: 10px; }
+            .info { margin-bottom: 20px; font-size: 0.9em; color: #666; }
+            table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+            th, td { text-align: left; padding: 12px; border-bottom: 1px solid #eee; }
+            th { background-color: #f8f9fa; color: #2c3e50; font-weight: 600; }
+            tr:hover { background-color: #fafafa; }
+            .no-grades { text-align: center; color: #e74c3c; padding: 20px; font-style: italic; }
+            .footer { margin-top: 30px; font-size: 0.8em; color: #aaa; text-align: center; }
+            .debug-section { margin-top: 40px; padding: 15px; background: #fffbe6; border: 1px dashed #ffe58f; border-radius: 8px; font-size: 0.85em; }
+            .debug-title { font-weight: bold; color: #856404; margin-bottom: 10px; }
+            pre { white-space: pre-wrap; word-wrap: break-word; background: #fefefe; padding: 10px; border: 1px solid #eee; }
+          </style>
+        </head>
+        <body>
+          <div class="container">
+            <h2>Reporte de Calificaciones</h2>
+            <div class="info">
+              <strong>Estudiante:</strong> ${fullName || "Estudiante"} (${matriculaInput})<br>
+              <strong>Materia:</strong> ${subject}
+            </div>
+            
+            ${studentGrades.length > 0 ? `
+              <table>
+                <thead>
+                  <tr>
+                    <th>Evaluación</th>
+                    <th>Calificación</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${studentGrades.map(g => `
+                    <tr>
+                      <td>${g.evaluacion}</td>
+                      <td><strong>${g.nota}</strong></td>
+                    </tr>
+                  `).join('')}
+                </tbody>
+              </table>
+            ` : `
+              <div class="no-grades">No se encontraron calificaciones registradas para este estudiante en esta sección.</div>
+            `}
+
+            ${isTeacher ? `
+              <div class="debug-section">
+                <div class="debug-title">🛠️ Panel de Depuración (Sólo visible para Docentes)</div>
+                <p>Moodle ha enviado los siguientes parámetros. Puedes usarlos para verificar el mapeo:</p>
+                <pre>${JSON.stringify(params, null, 2)}</pre>
+              </div>
+            ` : ""}
+            
+            <div class="footer">Generado automáticamente por UASD Grade Hub</div>
+          </div>
+        </body>
+      </html>
+    `;
+
+    return HtmlService.createHtmlOutput(html)
+      .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL)
+      .setTitle("UASD Grade Hub - " + matriculaInput);
+
+  } catch (e) {
+    logToDrive("Error en handleGetGrades: " + e.toString());
+    return HtmlService.createHtmlOutput("<h3>Error consultando calificaciones: " + e.toString() + "</h3>")
+      .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+  }
+}
+
+/**
+ * Busca todos los NRCs numéricos que pertenecen a una materia específica en /secciones.
+ */
+function getNrcsForSubject(subject) {
+  if (!subject) return [];
+  
+  logToDrive(`[RESOLVER] Buscando secciones para materia: ${subject}`);
+  
+  try {
+    const url = `${FIREBASE_URL}/secciones.json`;
+    const response = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+    
+    if (response.getResponseCode() !== 200) return [];
+    
+    const secciones = JSON.parse(response.getContentText());
+    if (!secciones) return [];
+    
+    const nrcs = [];
+    for (const nrcKey in secciones) {
+      const s = secciones[nrcKey];
+      if (s && s.codigoMateria === subject) {
+        nrcs.push(nrcKey);
+      }
+    }
+    
+    logToDrive(`[RESOLVER] Encontrados ${nrcs.length} NRCs para ${subject}: ${nrcs.join(", ")}`);
+    return nrcs;
+  } catch (e) {
+    logToDrive(`[RESOLVER] Error buscando NRCs para ${subject}: ${e.toString()}`);
+    return [];
+  }
+}
+
+/**
+ * Formatea el identificador de la sección.
+ * Si contiene un guión (ej. FIS1150-3), asegura que la sección tenga 2 dígitos (ej. FIS1150-03).
+ */
+function formatSectionIdentifier(identifier) {
+  if (!identifier) return "";
+  
+  // Limpiar espacios y asegurar string
+  identifier = String(identifier).trim();
+  
+  // Si no tiene guión, probablemente es un NRC normal, lo devolvemos tal cual
+  if (identifier.indexOf('-') === -1) {
+    return identifier;
+  }
+
+  const parts = identifier.split('-');
+  
+  // En UASD, la sección suele ser la última parte (ej: FIS1150-1 o FIS-2110-06)
+  // Tomamos el último elemento como sección y el resto como materia
+  let section = parts.pop();
+  let subject = parts.join('-');
+
+  // Si la sección es un número de un solo dígito, le agregamos el cero
+  if (section && section.length === 1 && !isNaN(section)) {
+    section = "0" + section;
+  }
+
+  return subject + "-" + section;
+}
+
+/**
+ * Función de logging a Google Drive
+ */
+function logToDrive(message) {
+  const fileName = "UASD_Debug_Log.txt";
+  const timestamp = new Date().toISOString();
+  const logEntry = `[${timestamp}] ${message}\n`;
+  
+  try {
+    const files = DriveApp.getFilesByName(fileName);
+    if (files.hasNext()) {
+      const file = files.next();
+      const currentContent = file.getBlob().getDataAsString();
+      file.setContent(currentContent + logEntry);
+    } else {
+      DriveApp.createFile(fileName, logEntry);
+    }
+    console.log(message);
+  } catch (e) {
+    console.error("Error writing to log file: " + e.toString());
+  }
+}
+
+/**
+ * Main function to process grades from audio using Firebase.
+ * @param {string} nrc The NRC of the section.
+ * @param {string} audioFileId The ID of the audio file in Google Drive.
+ * @param {string} evalId The ID of the evaluation in Firebase.
+ */
+function processGradesFromAudioFirebase(nrc, audioFileId, evalId) {
+  Logger.log(`Iniciando proceso Firebase. NRC: "${nrc}", Evaluación ID: "${evalId}"`);
+  
+  // 1. Obtener estudiantes desde Firebase
+  const studentsData = getStudentsFromFirebase(nrc);
+  Logger.log(`Estudiantes encontrados: ${Object.keys(studentsData).length}`);
+  
+  if (Object.keys(studentsData).length === 0) {
+    throw new Error(`No se encontraron estudiantes para NRC: ${nrc}`);
+  }
+
+  // 2. Transcribir Audio
+  let transcriptTable;
+  if (CONFIG.MODO_DEBUG === 1) {
+    Logger.log("MODO DEBUG ACTIVO: Usando datos hardcoded.");
+    transcriptTable = CONFIG.DEBUG_DATA;
+  } else {
+    transcriptTable = transcribeAudioWithGemini(audioFileId);
+  }
+  Logger.log(`AUDIO TRANSCRITO:\n${JSON.stringify(transcriptTable, null, 2)}`);
+
+  // 3. Procesar transcripción y hacer matching
+  let stats = {
+    procesados: 0,
+    noEncontrados: 0,
+    detallesProcesados: [],
+    listaNoEncontrados: [],
+    rescatesIA: 0
+  };
+
+  let unlocatedEntries = [];
+  const gradesToSave = {}; // { matricula: nota }
+
+  // Crear listas para fuzzy matching
+  const studentsList = Object.values(studentsData);
+  const namesList = studentsList.map(s => s.nombre);
+  const idsList = studentsList.map(s => s.matricula);
+
+  transcriptTable.forEach(entry => {
+    const getVal = (obj, keys) => {
+      const found = Object.keys(obj).find(k => keys.includes(k.toLowerCase().replace(/[\s_]/g, "")));
+      return found ? obj[found] : undefined;
+    };
+
+    const typeRaw = getVal(entry, ["tipo", "tipoidentificador"]);
+    const query = String(getVal(entry, ["dato", "datoidentificador"]) || "");
+    let grade = getVal(entry, ["nota"]);
+    if (grade !== undefined && grade !== null) {
+      grade = parseFloat(String(grade).replace(',', '.'));
+    }
+    const type = parseInt(typeRaw);
+
+    if (query === "" || query === "undefined") return;
+
+    // Buscar mejor coincidencia
+    const match = type === 0 
+      ? findBestMatch(query, idsList, 'id')
+      : findBestMatch(query, namesList, 'name');
+    
+    if (match && match.nivelCoincidencia >= CONFIG.THRESHOLD_COINCIDENCE && match.nivelDiscriminacion >= CONFIG.THRESHOLD_DISCRIMINATION) {
+      const student = studentsList[match.index];
+      gradesToSave[student.matricula] = grade;
+      
+      Logger.log(`✓ Match: "${query}" → ${student.nombre} (${student.matricula}) → Nota ${grade} (Coinc: ${match.nivelCoincidencia.toFixed(2)})`);
+      
+      stats.procesados++;
+      stats.detallesProcesados.push({
+        nombre: student.nombre,
+        id: student.matricula,
+        nota: grade,
+        coincidencia: match.nivelCoincidencia,
+        discriminacion: match.nivelDiscriminacion
+      });
+    } else {
+      Logger.log(`No se encontró coincidencia clara para: ${query} (Guardando para segunda pasada)`);
+      unlocatedEntries.push({ query: query, grade: grade, type: type });
+    }
+  });
+
+  // 4. SEGUNDA PASADA CON GEMINI (Opcional)
+  if (unlocatedEntries.length > 0) {
+    Logger.log("Intentando asociar los restantes con gemini...");
+    
+    // Recolectar candidatos (estudiantes sin nota asignada aún)
+    let candidates = [];
+    studentsList.forEach((s, idx) => {
+      if (!gradesToSave[s.matricula]) {
+        const normalizedName = s.nombre.includes(',') 
+          ? (s.nombre.split(',')[1].trim() + ' ' + s.nombre.split(',')[0].trim()) 
+          : s.nombre;
+        
+        candidates.push({
+          tempId: `${idx}`,
+          id_sheet: s.matricula,
+          nombre_sheet: normalizedName,
+          nombre_original: s.nombre
+        });
+      }
+    });
+
+    if (candidates.length > 0) {
+      const secondPassResults = processGradesWithGeminiSecondPass(unlocatedEntries, candidates);
+      
+      secondPassResults.forEach(res => {
+        const numericGrade = parseFloat(res.nota);
+        if (isNaN(numericGrade)) return;
+
+        const cand = candidates.find(c => c.tempId === res.tempId);
+        if (cand && res.match_encontrado === true) {
+          gradesToSave[cand.id_sheet] = numericGrade;
+          
+          Logger.log(`[IA Rescate] ${cand.nombre_original} asociado con ${res.dato_audio} (Nota: ${numericGrade})`);
+          
+          stats.procesados++;
+          stats.rescatesIA++;
+          stats.detallesProcesados.push({
+            nombre: cand.nombre_original,
+            id: cand.id_sheet,
+            nota: numericGrade,
+            coincidencia: 1.0,
+            discriminacion: 1.0
+          });
+          
+          unlocatedEntries = unlocatedEntries.filter(e => e.query !== res.dato_audio);
+        }
+      });
+    }
+  }
+  
+  // 5. Guardar notas en Firebase
+  if (Object.keys(gradesToSave).length > 0) {
+    Logger.log(`Guardando ${Object.keys(gradesToSave).length} notas en Firebase...`);
+    saveGradesToFirebase(nrc, evalId, gradesToSave);
+  }
+  
+  // Poblar lista final de no encontrados
+  stats.noEncontrados = unlocatedEntries.length;
+  stats.listaNoEncontrados = unlocatedEntries.map(e => `${e.query} (Nota: ${e.grade})`);
+
+  // 6. Resumen Final
+  Logger.log("\n--- RESUMEN DE PROCESAMIENTO ---");
+  Logger.log(`Estudiantes procesados correctamente: ${stats.procesados}`);
+  if (stats.detallesProcesados.length > 0) {
+    Logger.log("Detalle de estudiantes procesados:");
+    stats.detallesProcesados.forEach(d => {
+      Logger.log(`- ${d.nombre} (${d.id}) | Nota: ${d.nota} | Coinc: ${d.coincidencia.toFixed(2)} | Disc: ${d.discriminacion.toFixed(2)}`);
+    });
+  }
+  
+  Logger.log(`Estudiantes no encontrados: ${stats.noEncontrados}`);
+  if (stats.listaNoEncontrados.length > 0) {
+    Logger.log("Lista de datos no ubicados:\n- " + stats.listaNoEncontrados.join("\n- "));
+  }
+  Logger.log("--------------------------------\n");
+  
+  return stats;
+}
+
+/**
+ * Obtiene los estudiantes desde Firebase para un NRC dado.
+ * Retorna un objeto con los datos de los estudiantes.
+ */
+function getStudentsFromFirebase(nrc) {
+  const url = `${FIREBASE_URL}/seccion_detalles/${nrc}/estudiantes.json`;
+  logToDrive("Fetching estudiantes from: " + url);
+  
+  try {
+    const response = UrlFetchApp.fetch(url);
+    const data = JSON.parse(response.getContentText());
+    
+    if (!data) {
+      logToDrive("ADVERTENCIA: No se encontraron estudiantes en Firebase");
+      return {};
+    }
+    
+    // Convertir a array de estudiantes
+    return data;
+  } catch (e) {
+    logToDrive("ERROR obteniendo estudiantes: " + e.toString());
+    throw new Error(`Error obteniendo estudiantes de Firebase: ${e.message}`);
+  }
+}
+
+/**
+ * Guarda las notas en Firebase.
+ * @param {string} nrc El NRC de la sección.
+ * @param {string} evalId El ID de la evaluación.
+ * @param {object} gradesToSave Objeto con { matricula: nota }
+ */
+function saveGradesToFirebase(nrc, evalId, gradesToSave) {
+  const gradesUrl = `${FIREBASE_URL}/seccion_detalles/${nrc}/notas/${evalId}.json`;
+  logToDrive("Haciendo PATCH a: " + gradesUrl);
+  logToDrive("Payload: " + JSON.stringify(gradesToSave));
+  
+  // -- INICIO CREACION HISTORIAL RESPALDO --
+  try {
+    const backupResponse = UrlFetchApp.fetch(gradesUrl, { muteHttpExceptions: true });
+    if (backupResponse.getResponseCode() === 200) {
+      const currentGrades = JSON.parse(backupResponse.getContentText());
+      if (currentGrades && Object.keys(currentGrades).length > 0) {
+        const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+        const historyUrl = `${FIREBASE_URL}/seccion_detalles/${nrc}/historial_dictados/${evalId}/${timestamp}.json`;
+        logToDrive("Creando respaldo de notas previas en: " + historyUrl);
+        UrlFetchApp.fetch(historyUrl, {
+          "method": "put",
+          "payload": JSON.stringify(currentGrades),
+          "contentType": "application/json",
+          "muteHttpExceptions": true
+        });
+      }
+    }
+  } catch (err) {
+    logToDrive("Error creando respaldo de notas: " + err.toString());
+  }
+  // -- FIN CREACION HISTORIAL RESPALDO --
+  
+  const payload = JSON.stringify(gradesToSave);
+  const options = {
+    "method": "patch",
+    "payload": payload,
+    "contentType": "application/json",
+    "muteHttpExceptions": true
+  };
+  
+  const response = UrlFetchApp.fetch(gradesUrl, options);
+  const responseCode = response.getResponseCode();
+  const responseText = response.getContentText();
+  
+  if (responseCode >= 200 && responseCode < 300) {
+    logToDrive(`✓ Firebase actualizado exitosamente. Código: ${responseCode}`);
+    logToDrive(`Respuesta Firebase: ${responseText}`);
+  } else {
+    logToDrive(`✗ ERROR en actualización Firebase. Código: ${responseCode}`);
+    logToDrive(`Respuesta: ${responseText}`);
+    throw new Error(`Firebase PATCH falló con código ${responseCode}: ${responseText}`);
+  }
+}
+
+/**
+ * Main function to be called from the Sheet or manually (LEGACY - kept for backwards compatibility).
+ * @param {string} spreadsheetId The ID of the Google Sheet.
+ * @param {string} audioFileId The ID of the audio file in Google Drive.
+ * @param {string} evaluationName The name of the column where grades should be saved.
+ */
+function processGradesFromAudio(spreadsheetId, audioFileId, evaluationName) {
+  spreadsheetId = String(spreadsheetId || "").trim();
+  audioFileId = String(audioFileId || "").trim();
+  evaluationName = String(evaluationName || "").trim();
+  
+  Logger.log(`Iniciando proceso multi-hoja. Spreadsheet ID: "${spreadsheetId}", Evaluación: "${evaluationName}"`);
+  
+  let ss;
+  try {
+    ss = spreadsheetId ? SpreadsheetApp.openById(spreadsheetId) : SpreadsheetApp.getActiveSpreadsheet();
+  } catch (e) {
+    throw new Error(`No se pudo abrir la hoja de cálculo: ${e.message}`);
+  }
+
+  const allSheets = ss.getSheets();
+  const cachedSheets = [];
+
+  // Pre-procesar todas las hojas para ganar velocidad
+  allSheets.forEach(sheet => {
+    const data = sheet.getDataRange().getValues();
+    if (data.length < 1) return;
+
+    const headers = data[0];
+    const colIndex = headers.findIndex(h => String(h).trim().toLowerCase() === evaluationName.toLowerCase()) + 1;
+    
+    if (colIndex > 0) {
+      const students = data.slice(1).map((row, index) => ({
+        id: String(row[0]).trim(),
+        name: String(row[1]).trim(),
+        grade: String(row[colIndex - 1]).trim(),
+        rowIndex: index + 2
+      }));
+
+      cachedSheets.push({
+        sheetObject: sheet,
+        name: sheet.getName(),
+        colIndex: colIndex,
+        students: students
+      });
+    } else {
+      Logger.log(`Aviso: La hoja "${sheet.getName()}" no tiene la columna "${evaluationName}". Se omitirá.`);
+    }
+  });
+
+  if (cachedSheets.length === 0) {
+    throw new Error(`No se encontró la columna "${evaluationName}" en ninguna de las hojas.`);
+  }
+
+  // 1. Transcribir Audio
+  let transcriptTable;
+  if (CONFIG.MODO_DEBUG === 1) {
+    Logger.log("MODO DEBUG ACTIVO: Usando datos hardcoded.");
+    transcriptTable = CONFIG.DEBUG_DATA;
+  } else {
+    transcriptTable = transcribeAudioWithGemini(audioFileId);
+  }
+  Logger.log(`AUDIO TRANSCRITO:\n${JSON.stringify(transcriptTable, null, 2)}`);
+
+  // 2. Procesar con foco dinámico
+  let activeSheetIdx = 0; // Empezamos con la primera hoja válida
+  let stats = {
+    procesados: 0,
+    noEncontrados: 0,
+    detallesProcesados: [],
+    listaNoEncontrados: [],
+    rescatesIA: 0
+  };
+
+  let unlocatedEntries = [];
+
+  transcriptTable.forEach(entry => {
+    const getVal = (obj, keys) => {
+      const found = Object.keys(obj).find(k => keys.includes(k.toLowerCase().replace(/[\s_]/g, "")));
+      return found ? obj[found] : undefined;
+    };
+
+    const typeRaw = getVal(entry, ["tipo", "tipoidentificador"]);
+    const query = String(getVal(entry, ["dato", "datoidentificador"]) || "");
+    const grade = getVal(entry, ["nota"]);
+    const type = parseInt(typeRaw);
+
+    if (query === "" || query === "undefined") return;
+
+    let bestMatchGlobal = null;
+    let foundInSheetIdx = -1;
+
+    // 1. ESCANEO GLOBAL PARA BUSCAR EL MEJOR CANDIDATO ABSOLUTO
+    // Buscamos en todas las hojas para asegurar que Jonathan Caro no se confunda con Eliana Bueno solo por estar en la misma fila.
+    for (let i = 0; i < cachedSheets.length; i++) {
+      // Optimizamos: si es la hoja activa, es nuestra primera opción
+      const sheetToSearch = cachedSheets[i];
+      const match = findBestMatchInSheet(query, type, sheetToSearch);
+      
+      if (match && match.nivelCoincidencia >= CONFIG.THRESHOLD_COINCIDENCE && match.nivelDiscriminacion >= CONFIG.THRESHOLD_DISCRIMINATION) {
+        // Si no tenemos nada o si este nuevo match es significativamente mejor que el anterior
+        if (!bestMatchGlobal || match.nivelCoincidencia > bestMatchGlobal.nivelCoincidencia) {
+          bestMatchGlobal = match;
+          foundInSheetIdx = i;
+        }
+      }
+    }
+
+    if (bestMatchGlobal && foundInSheetIdx !== -1) {
+      const targetSheetData = cachedSheets[foundInSheetIdx];
+      const student = targetSheetData.students[bestMatchGlobal.index];
+      targetSheetData.sheetObject.getRange(student.rowIndex, targetSheetData.colIndex).setValue(grade);
+      student.grade = grade; // Actualizar cache local
+      Logger.log(`[Hoja: ${targetSheetData.name}] Actualizado ${student.name} con nota ${grade} (Coinc: ${bestMatchGlobal.nivelCoincidencia.toFixed(2)})`);
+      
+      stats.procesados++;
+      stats.detallesProcesados.push({
+        nombre: student.name,
+        id: student.id,
+        nota: grade,
+        coincidencia: bestMatchGlobal.nivelCoincidencia,
+        discriminacion: bestMatchGlobal.nivelDiscriminacion,
+        hoja: targetSheetData.name
+      });
+
+      if (foundInSheetIdx !== activeSheetIdx) {
+        Logger.log(`Cambiando foco dinámico a la hoja: ${targetSheetData.name}`);
+        activeSheetIdx = foundInSheetIdx;
+      }
+    } else {
+      Logger.log(`No se encontró coincidencia clara para: ${query} (Guardando para segunda pasada)`);
+      unlocatedEntries.push({ query: query, grade: grade, type: type });
+    }
+  });
+
+  // 3. SEGUNDA PASADA CON GEMINI (Opcional)
+  if (unlocatedEntries.length > 0) {
+    Logger.log("Intentando asociar los restantes con gemini...");
+    
+    // Recolectar candidatos (estudiantes que tengan la celda de la nota vacía)
+    let candidates = [];
+    cachedSheets.forEach((sData, sIdx) => {
+      sData.students.forEach((s, rIdx) => {
+        if (!s.grade || s.grade === "" || s.grade === "undefined") {
+          // Normalizamos el nombre para que Gemini lo lea más fácil (sin comas inversas)
+          const normalizedName = s.name.includes(',') ? (s.name.split(',')[1].trim() + ' ' + s.name.split(',')[0].trim()) : s.name;
+          
+          candidates.push({
+            tempId: `${sIdx}_${rIdx}`, // ID único para evitar confusiones de filas iguales en hojas distintas
+            id_sheet: s.id,
+            nombre_sheet: normalizedName,
+            nombre_original: s.name // Guardamos el original para ubicarlo luego
+          });
+        }
+      });
+    });
+
+    if (candidates.length > 0) {
+      const secondPassResults = processGradesWithGeminiSecondPass(unlocatedEntries, candidates);
+      
+      secondPassResults.forEach(res => {
+        const numericGrade = parseFloat(res.nota);
+        if (isNaN(numericGrade)) return;
+
+        // Buscar por el ID ÚNICO que asignamos
+        const cand = candidates.find(c => c.tempId === res.tempId);
+        if (cand && res.match_encontrado === true) {
+          const IDs = cand.tempId.split('_');
+          const targetSheetData = cachedSheets[parseInt(IDs[0])];
+          const student = targetSheetData.students[parseInt(IDs[1])];
+          
+          targetSheetData.sheetObject.getRange(student.rowIndex, targetSheetData.colIndex).setValue(numericGrade);
+          
+          Logger.log(`[IA Rescate] ${cand.nombre_original} asociado con ${res.dato_audio} (Nota: ${numericGrade})`);
+          
+          stats.procesados++;
+          stats.rescatesIA++;
+          stats.detallesProcesados.push({
+            nombre: cand.name,
+            id: cand.id,
+            nota: res.nota,
+            coincidencia: 1.0, // Simulado para IA
+            discriminacion: 1.0, 
+            hoja: targetSheetData.name + " (Rescatado por IA)"
+          });
+          
+          // Eliminar de los no ubicados para el reporte final
+          unlocatedEntries = unlocatedEntries.filter(e => e.query !== res.dato_audio);
+        }
+      });
+    }
+  }
+  
+  // Poblar lista final de no encontrados
+  stats.noEncontrados = unlocatedEntries.length;
+  stats.listaNoEncontrados = unlocatedEntries.map(e => `${e.query} (Nota: ${e.grade})`);
+
+  // 4. Resumen Final
+  Logger.log("\n--- RESUMEN DE PROCESAMIENTO ---");
+  Logger.log(`Estudiantes procesados correctamente: ${stats.procesados}`);
+  if (stats.detallesProcesados.length > 0) {
+    Logger.log("Detalle de estudiantes procesados:");
+    stats.detallesProcesados.forEach(d => {
+      Logger.log(`- ${d.nombre} (${d.id}) | Nota: ${d.nota} | Coinc: ${d.coincidencia.toFixed(2)} | Disc: ${d.discriminacion.toFixed(2)} | Hoja: ${d.hoja}`);
+    });
+  }
+  
+  Logger.log(`Estudiantes no encontrados: ${stats.noEncontrados}`);
+  if (stats.listaNoEncontrados.length > 0) {
+    Logger.log("Lista de datos no ubicados:\n- " + stats.listaNoEncontrados.join("\n- "));
+  }
+  Logger.log("--------------------------------\n");
+  
+  return stats;
+}
+
+/**
+ * Helper para buscar dentro de una estructura de hoja cacheada.
+ */
+function findBestMatchInSheet(query, type, sheetData) {
+  if (type === 0) {
+    return findBestMatch(query, sheetData.students.map(s => s.id), 'id');
+  } else {
+    return findBestMatch(query, sheetData.students.map(s => s.name), 'name');
+  }
+}
+
+/**
+ * Usa Gemini para intentar asociar registros que no pudieron ser ubicados algorítmicamente.
+ */
+function processGradesWithGeminiSecondPass(missingEntries, candidates) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${CONFIG.MODEL}:generateContent?key=${CONFIG.API_KEY}`;
+  
+  const prompt = `Analiza estas transcripciones de audio que no pudieron ser ubicadas automáticamente.
+Usa tu razonamiento avanzado para asociar cada "dato_audio" con el "nombre_sheet" o "id_sheet" más probable de los candidatos.
+
+REGLAS CRÍTICAS:
+1. La "nota" DEBE ser estrictamente un número (ej. 15, 8.5). No incluyas texto en el campo de nota.
+2. Solo marca "match_encontrado": true si la confianza es alta. Si es dudosa, usa false.
+3. NO des explicaciones ni texto adicional. Responde ÚNICAMENTE con el JSON array.
+
+TRANSCRIPCIONES SIN UBICAR:
+${JSON.stringify(missingEntries, null, 2)}
+
+CANDIDATOS DISPONIBLES (SIN NOTA):
+${JSON.stringify(candidates, null, 2)}
+
+ESTRUCTURA DE RESPUESTA:
+[
+  {
+    "dato_audio": "...",
+    "tempId": "...",  // USA EL tempId QUE TE PROPORCIONO
+    "nota": 0.0,
+    "match_encontrado": true/false
+  }
+]`;
+
+  const payload = {
+    contents: [{
+      parts: [{ text: prompt }]
+    }]
+  };
+
+  const options = {
+    method: "POST",
+    contentType: "application/json",
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  try {
+    const response = UrlFetchApp.fetch(url, options);
+    const text = JSON.parse(response.getContentText()).candidates[0].content.parts[0].text;
+    const jsonMatch = text.match(/\[[\s\S]*\]/);
+    return jsonMatch ? JSON.parse(jsonMatch[0]) : [];
+  } catch (e) {
+    Logger.log(`Error en la segunda pasada de Gemini: ${e.message}`);
+    return [];
+  }
+}
+
+/**
+ * Transcribes audio using Gemini API.
+ */
+function transcribeAudioWithGemini(fileId) {
+  Logger.log(`Accediendo al archivo en Drive con ID: "${fileId}"`);
+  const file = DriveApp.getFileById(fileId);
+  const blob = file.getBlob();
+  const base64Audio = Utilities.base64Encode(blob.getBytes());
+  const mimeType = blob.getContentType();
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${CONFIG.MODEL}:generateContent?key=${CONFIG.API_KEY}`;
+  
+  const payload = {
+    contents: [{
+      parts: [
+        { text: `${CONFIG.SYSTEM_PROMPT}\n\nAnaliza el audio adjunto. Crea una tabla simple JSON array de objetos con estas 3 llaves exactas:\n"tipo": (0 si es matricula, 1 si es nombre),\n"dato": (la matrícula o nombre dicho),\n"nota": (la nota dictada).\n\nResponde SOLO con el JSON array.` },
+        { inline_data: { mime_type: mimeType, data: base64Audio } }
+      ]
+    }]
+  };
+
+  const options = {
+    method: "POST",
+    contentType: "application/json",
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  const response = UrlFetchApp.fetch(url, options);
+  const responseText = response.getContentText();
+  const statusCode = response.getResponseCode();
+  
+  if (statusCode !== 200) {
+    Logger.log(`API Error (Status ${statusCode}): ${responseText}`);
+    throw new Error(`Gemini API failed with status ${statusCode}. Check logs for details.`);
+  }
+
+  const result = JSON.parse(responseText);
+  
+  if (!CONFIG.API_KEY) {
+    throw new Error("No se encontró la clave de API. Por favor, ve a la configuración del proyecto y añade 'GEMINI_API_KEY' en Propiedades de script.");
+  }
+
+  if (result.candidates && result.candidates[0].content && result.candidates[0].content.parts) {
+    const textResponse = result.candidates[0].content.parts[0].text;
+    // Extended regex to find JSON array even if there is surrounding text
+    const jsonMatch = textResponse.match(/\[[\s\S]*\]/);
+    if (jsonMatch) {
+      return JSON.parse(jsonMatch[0]);
+    }
+    Logger.log(`Unexpected text response: ${textResponse}`);
+  }
+  
+  Logger.log(`Full result: ${JSON.stringify(result)}`);
+  throw new Error("Failed to transcribe audio or invalid format returned. Check logs.");
+}
+
+/**
+ * Similarity wrapper.
+ */
+function findBestMatch(query, list, type) {
+  let results = list.map((item, index) => {
+    let score = (type === 'id') ? calculateLevenshteinSimilarity(query, item) : calculateNameSimilarity(query, item);
+    return { index, score };
+  });
+
+  // Sort by score descending
+  results.sort((a, b) => b.score - a.score);
+
+  if (results.length === 0) return null;
+
+  const best = results[0];
+  const secondBestScore = results.length > 1 ? results[1].score : 0;
+  
+  return {
+    index: best.index,
+    nivelCoincidencia: best.score,
+    nivelDiscriminacion: best.score - secondBestScore
+  };
+}
+
+/**
+ * Levenshtein Distance converted to 0-1 similarity.
+ */
+function calculateLevenshteinSimilarity(s1, s2) {
+  s1 = s1.toLowerCase();
+  s2 = s2.toLowerCase();
+  
+  const m = s1.length;
+  const n = s2.length;
+  const d = [];
+
+  for (let i = 0; i <= m; i++) d[i] = [i];
+  for (let j = 0; j <= n; j++) d[0][j] = j;
+
+  for (let j = 1; j <= n; j++) {
+    for (let i = 1; i <= m; i++) {
+      if (s1[i - 1] === s2[j - 1]) d[i][j] = d[i - 1][j - 1];
+      else d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + 1);
+    }
+  }
+
+  const distance = d[m][n];
+  const maxLength = Math.max(m, n);
+  return maxLength === 0 ? 1 : 1 - (distance / maxLength);
+}
+
+/**
+ * Token-based similarity for names.
+ * Handles different orderings, partial names, and "Lastname, Firstname" formats.
+ */
+function calculateNameSimilarity(name1, name2) {
+  const normalize = (s) => {
+    // Detect "Lastname, Firstname" (has a comma)
+    if (s.includes(',')) {
+      const parts = s.split(',');
+      // Reorder to "Firstname Lastname" and trim extra spaces
+      s = parts.slice(1).join(' ').trim() + ' ' + parts[0].trim();
+    }
+    return s.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").split(/\W+/).filter(t => t.length > 0);
+  };
+  
+  const tokens1 = normalize(name1);
+  const tokens2 = normalize(name2);
+  
+  if (tokens1.length === 0 || tokens2.length === 0) return 0;
+
+  let totalScore = 0;
+  
+  // For each token in the query (audio), find the best match in the sheet name
+  tokens1.forEach(t1 => {
+    let bestTokenScore = 0;
+    tokens2.forEach(t2 => {
+      // Use Jaro-Winkler for token-to-token comparison
+      const s = calculateJaroWinkler(t1, t2);
+      if (s > bestTokenScore) bestTokenScore = s;
+    });
+    
+    // Threshold for a token match
+    if (bestTokenScore > 0.85) {
+      totalScore += bestTokenScore;
+    }
+  });
+
+  const precision = totalScore / tokens1.length;
+  const recall = totalScore / tokens2.length;
+  
+  // F1-style balance, slightly favoring precision (not matching extra stuff)
+  return (2 * precision * recall) / (precision + recall) || 0;
+}
+
+/**
+ * Jaro-Winkler similarity algorithm.
+ * Better for names as it gives more weight to common prefixes.
+ */
+function calculateJaroWinkler(s1, s2) {
+  if (s1 === s2) return 1.0;
+
+  const len1 = s1.length;
+  const len2 = s2.length;
+  const matchWindow = Math.floor(Math.max(len1, len2) / 2) - 1;
+
+  const matches1 = new Array(len1).fill(false);
+  const matches2 = new Array(len2).fill(false);
+
+  let matches = 0;
+  for (let i = 0; i < len1; i++) {
+    const start = Math.max(0, i - matchWindow);
+    const end = Math.min(i + matchWindow + 1, len2);
+    for (let j = start; j < end; j++) {
+      if (matches2[j] || s1[i] !== s2[j]) continue;
+      matches1[i] = true;
+      matches2[j] = true;
+      matches++;
+      break;
+    }
+  }
+
+  if (matches === 0) return 0.0;
+
+  let transpositions = 0;
+  let k = 0;
+  for (let i = 0; i < len1; i++) {
+    if (!matches1[i]) continue;
+    while (!matches2[k]) k++;
+    if (s1[i] !== s2[k]) transpositions++;
+    k++;
+  }
+
+  const jaro = (matches / len1 + matches / len2 + (matches - transpositions / 2) / matches) / 3;
+
+  // Winkler improvement: prefix matching
+  let prefix = 0;
+  const maxPrefix = 4;
+  for (let i = 0; i < Math.min(len1, len2, maxPrefix); i++) {
+    if (s1[i] === s2[i]) prefix++;
+    else break;
+  }
+
+  return jaro + prefix * 0.1 * (1 - jaro);
+}
