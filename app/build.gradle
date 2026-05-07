@@ -6,12 +6,12 @@ plugins {
 
 android {
     namespace 'com.uasd.main'
-    compileSdk 33
+    compileSdk 34
 
     defaultConfig {
         applicationId "com.uasd.main"
         minSdk 24
-        targetSdk 33
+        targetSdk 34
         versionCode 1
         versionName "1.0"
 
@@ -69,6 +69,13 @@ dependencies {
     // Coroutines
     implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.6.4'
     implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.6.4'
+
+    // Vosk Voice Recognition
+    implementation 'com.alphacephei:vosk-android:0.3.32'
+    implementation 'net.java.dev.jna:jna:5.13.0@aar'
+
+    // Gemini AI
+    implementation 'com.google.ai.client.generativeai:generativeai:0.7.0'
 
     testImplementation 'junit:junit:4.13.2'
     androidTestImplementation 'androidx.test.ext:junit:1.1.5'

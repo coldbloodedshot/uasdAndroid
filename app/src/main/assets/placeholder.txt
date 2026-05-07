@@ -1,0 +1,1 @@
+Este archivo es un marcador de posición para asegurar que la carpeta assets exista. Aquí debes colocar la carpeta del modelo de Vosk (ej: model-es).

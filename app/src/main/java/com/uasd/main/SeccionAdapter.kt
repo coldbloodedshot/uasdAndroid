@@ -86,6 +86,8 @@ class SeccionAdapter(
         notifyDataSetChanged()
     }
 
+    fun getData(): List<Seccion> = secciones
+
     class SeccionViewHolder(itemView: View) : RecyclerView.ViewHolder(itemView) {
         private val tvNombre: TextView = itemView.findViewById(R.id.tvNombre)
         private val tvProfesor: TextView = itemView.findViewById(R.id.tvProfesor)

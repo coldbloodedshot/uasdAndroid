@@ -14,4 +14,10 @@
         android:title="Estadísticas"
         android:icon="@android:drawable/ic_menu_info_details"
         app:showAsAction="never" />
+
+    <item
+        android:id="@+id/action_dictation_settings"
+        android:title="Ajustes de Dictado"
+        android:icon="@android:drawable/ic_menu_preferences"
+        app:showAsAction="never" />
 </menu>

@@ -32,9 +32,12 @@ class MainActivity : AppCompatActivity() {
         tvEmpty = findViewById(R.id.textViewEmpty)
         recyclerView.layoutManager = LinearLayoutManager(this)
         adapter = SeccionAdapter(emptyList()) { seccion ->
+            val sameSubjectSections = adapter.getData().filter { it.nombreMateria == seccion.nombreMateria }
+            val selectedIndex = sameSubjectSections.indexOf(seccion)
+            
             val intent = android.content.Intent(this, StudentListActivity::class.java).apply {
-                putExtra("NRC", seccion.nrc)
-                putExtra("MATERIA", seccion.nombreMateria)
+                putExtra("SECCIONES_LIST", ArrayList(sameSubjectSections))
+                putExtra("SELECTED_INDEX", selectedIndex)
             }
             startActivity(intent)
         }
