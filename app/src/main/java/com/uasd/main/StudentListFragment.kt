@@ -96,6 +96,11 @@ class StudentListFragment : Fragment() {
     private var currentQuery: String = ""
     private var pendingSelectEvalId: String? = null
     
+    private var estudiantesListener: ValueEventListener? = null
+    private var evaluacionesListener: ValueEventListener? = null
+    private var notasListener: ValueEventListener? = null
+    private var observacionesListener: ValueEventListener? = null
+    
     private var voskModel: Model? = null
     private var voskSpeechService: SpeechService? = null
     private var nativeSpeechRecognizer: SpeechRecognizer? = null
@@ -106,6 +111,7 @@ class StudentListFragment : Fragment() {
     private var isVoskLoading = false
     private var currentDictationMatchId: String? = null
     private var currentDictationSuggestedGrade: Double? = null
+    private var geminiStartTime: Long = 0
     
     private val PREFS_NAME = "uasd_prefs"
     private val KEY_LAST_EXTRA = "last_extra_points"
@@ -128,6 +134,11 @@ class StudentListFragment : Fragment() {
             codigoMateria = it.getString(ARG_CODIGO_MATERIA)
             seccion = it.getString(ARG_SECCION)
             materia = it.getString(ARG_MATERIA)
+        }
+        
+        savedInstanceState?.let {
+            currentQuery = it.getString("currentQuery", "")
+            pendingSelectEvalId = it.getString("selectedEvalId")
         }
     }
 
@@ -232,7 +243,7 @@ class StudentListFragment : Fragment() {
             spinnerEvaluaciones.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
                 override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
                     actualizarLista()
-                    requireActivity().invalidateOptionsMenu()
+                    activity?.invalidateOptionsMenu()
                 }
                 override fun onNothingSelected(parent: AdapterView<*>?) {}
             }
@@ -246,6 +257,10 @@ class StudentListFragment : Fragment() {
                 }
                 override fun afterTextChanged(s: android.text.Editable?) {}
             })
+            if (currentQuery.isNotEmpty()) {
+                etSearch.setText(currentQuery)
+                ivClearSearch.visibility = View.VISIBLE
+            }
         }
         
         val prefs = requireContext().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -296,8 +311,11 @@ class StudentListFragment : Fragment() {
     private fun cargarDatos() {
         val pathDetalles = database.child("seccion_detalles").child(nrc!!)
         
-        pathDetalles.child("estudiantes").addValueEventListener(object : ValueEventListener {
+        removeListeners() // Limpiar si ya había alguno
+
+        estudiantesListener = object : ValueEventListener {
             override fun onDataChange(snapshot: DataSnapshot) {
+                if (!isAdded) return
                 listaAlumnosOriginal.clear()
                 for (s in snapshot.children) {
                     s.getValue(Estudiante::class.java)?.let { listaAlumnosOriginal.add(it) }
@@ -305,10 +323,12 @@ class StudentListFragment : Fragment() {
                 actualizarLista()
             }
             override fun onCancelled(error: DatabaseError) {}
-        })
+        }
+        pathDetalles.child("estudiantes").addValueEventListener(estudiantesListener!!)
 
-        pathDetalles.child("evaluaciones").addValueEventListener(object : ValueEventListener {
+        evaluacionesListener = object : ValueEventListener {
             override fun onDataChange(snapshot: DataSnapshot) {
+                if (!isAdded) return
                 evaluaciones.clear()
                 val nombresEval = mutableListOf(ACUMULADO_TEXT)
                 for (s in snapshot.children) {
@@ -317,7 +337,9 @@ class StudentListFragment : Fragment() {
                         nombresEval.add(getEvalDisplayName(it))
                     }
                 }
-                val spinnerAdapter = ArrayAdapter(requireContext(), android.R.layout.simple_spinner_item, nombresEval)
+                
+                val currentContext = context ?: return
+                val spinnerAdapter = ArrayAdapter(currentContext, android.R.layout.simple_spinner_item, nombresEval)
                 spinnerAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
                 spinnerEvaluaciones.adapter = spinnerAdapter
 
@@ -334,19 +356,29 @@ class StudentListFragment : Fragment() {
                         }
                     }
                 } else if (seleccionActual == null || seleccionActual == ACUMULADO_TEXT) {
-                    val extraEval = evaluaciones.find { it.esExtra == 1 }
-                    if (extraEval != null) {
-                        val displayName = getEvalDisplayName(extraEval)
+                    val targetEval = if (pendingSelectEvalId != null) {
+                        evaluaciones.find { it.id == pendingSelectEvalId }
+                    } else {
+                        evaluaciones.find { it.esExtra == 1 }
+                    }
+                    
+                    if (targetEval != null) {
+                        val displayName = getEvalDisplayName(targetEval)
                         val pos = nombresEval.indexOf(displayName)
-                        if (pos != -1) spinnerEvaluaciones.setSelection(pos)
+                        if (pos != -1) {
+                            spinnerEvaluaciones.setSelection(pos)
+                            pendingSelectEvalId = null
+                        }
                     }
                 }
             }
             override fun onCancelled(error: DatabaseError) {}
-        })
+        }
+        pathDetalles.child("evaluaciones").addValueEventListener(evaluacionesListener!!)
 
-        pathDetalles.child("notas").addValueEventListener(object : ValueEventListener {
+        notasListener = object : ValueEventListener {
             override fun onDataChange(snapshot: DataSnapshot) {
+                if (!isAdded) return
                 todasLasNotas.clear()
                 for (evalSnapshot in snapshot.children) {
                     val evalId = evalSnapshot.key ?: continue
@@ -361,10 +393,12 @@ class StudentListFragment : Fragment() {
                 actualizarLista()
             }
             override fun onCancelled(error: DatabaseError) {}
-        })
+        }
+        pathDetalles.child("notas").addValueEventListener(notasListener!!)
 
-        pathDetalles.child("observaciones").addValueEventListener(object : ValueEventListener {
+        observacionesListener = object : ValueEventListener {
             override fun onDataChange(snapshot: DataSnapshot) {
+                if (!isAdded) return
                 observacionesMap.clear()
                 for (s in snapshot.children) {
                     val mat = s.key ?: continue
@@ -374,7 +408,22 @@ class StudentListFragment : Fragment() {
                 actualizarLista()
             }
             override fun onCancelled(error: DatabaseError) {}
-        })
+        }
+        pathDetalles.child("observaciones").addValueEventListener(observacionesListener!!)
+    }
+
+    private fun removeListeners() {
+        if (nrc == null) return
+        val pathDetalles = database.child("seccion_detalles").child(nrc!!)
+        estudiantesListener?.let { pathDetalles.child("estudiantes").removeEventListener(it) }
+        evaluacionesListener?.let { pathDetalles.child("evaluaciones").removeEventListener(it) }
+        notasListener?.let { pathDetalles.child("notas").removeEventListener(it) }
+        observacionesListener?.let { pathDetalles.child("observaciones").removeEventListener(it) }
+        
+        estudiantesListener = null
+        evaluacionesListener = null
+        notasListener = null
+        observacionesListener = null
     }
 
     private fun actualizarLista() {
@@ -466,11 +515,12 @@ class StudentListFragment : Fragment() {
             .setPositiveButton("Guardar") { _, _ ->
                 val nombre = etNombre.text.toString()
                 val valor = etValor.text.toString().toIntOrNull() ?: 0
-                if (nombre.isNotEmpty() && valor > 0) {
-                    val id = database.child("seccion_detalles").child(nrc!!).child("evaluaciones").push().key ?: ""
+                val currentNrc = nrc
+                if (nombre.isNotEmpty() && valor > 0 && currentNrc != null) {
+                    val id = database.child("seccion_detalles").child(currentNrc).child("evaluaciones").push().key ?: ""
                     pendingSelectEvalId = id
                     val eval = Evaluacion(id, nombre, valor, 0)
-                    database.child("seccion_detalles").child(nrc!!).child("evaluaciones").child(id).setValue(eval)
+                    database.child("seccion_detalles").child(currentNrc).child("evaluaciones").child(id).setValue(eval)
                 }
             }
             .setNegativeButton("Cancelar", null)
@@ -770,11 +820,15 @@ class StudentListFragment : Fragment() {
         (requireActivity() as? AppCompatActivity)?.supportActionBar?.title = "DICTADO NATIVO (Escuchando...)"
         btnDictado.setColorFilter(android.graphics.Color.RED)
         
+        // Limpiar instancia previa si existe para evitar el error 10 (Too many requests)
+        nativeSpeechRecognizer?.destroy()
         nativeSpeechRecognizer = SpeechRecognizer.createSpeechRecognizer(requireContext())
+
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE, "es-ES")
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, "es-US")
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+            putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
         }
         
         var isFirstReady = true
@@ -785,13 +839,42 @@ class StudentListFragment : Fragment() {
                     isFirstReady = false
                 }
             }
-            override fun onBeginningOfSpeech() {}
+            override fun onBeginningOfSpeech() {
+                Log.d("DictadoNativo", "Inicio de habla detectado")
+            }
             override fun onRmsChanged(rmsdB: Float) {}
             override fun onBufferReceived(buffer: ByteArray?) {}
-            override fun onEndOfSpeech() {}
+            override fun onEndOfSpeech() {
+                Log.d("DictadoNativo", "Fin de habla detectado")
+            }
             override fun onError(error: Int) {
-                if (isDictationMode && (error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT || error == SpeechRecognizer.ERROR_NO_MATCH)) {
-                    nativeSpeechRecognizer?.startListening(intent)
+                Log.e("DictadoNativo", "Error de dictado: $error")
+                val errorMsg = when(error) {
+                    1 -> "Network timeout"
+                    2 -> "Network error"
+                    3 -> "Audio error"
+                    4 -> "Server error"
+                    5 -> "Client error"
+                    6 -> "Speech timeout"
+                    7 -> "No match"
+                    8 -> "Busy"
+                    9 -> "Insufficient permissions"
+                    10 -> "Too many requests"
+                    11 -> "Server disconnected"
+                    12 -> "Language not supported"
+                    13 -> "Language unavailable"
+                    else -> "Unknown error ($error)"
+                }
+                
+                if (isAdded) {
+                    Toast.makeText(requireContext(), "Error Dictado: $errorMsg", Toast.LENGTH_SHORT).show()
+                }
+
+                if (isDictationMode && (error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT || error == SpeechRecognizer.ERROR_NO_MATCH || error == 7)) {
+                    // Añadir un pequeño retraso para evitar el error 10 (Too many requests)
+                    view?.postDelayed({
+                        if (isDictationMode) nativeSpeechRecognizer?.startListening(intent)
+                    }, 500)
                 } else {
                     detenerDictado()
                 }
@@ -799,7 +882,7 @@ class StudentListFragment : Fragment() {
             override fun onResults(results: Bundle?) {
                 val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                 if (!matches.isNullOrEmpty()) {
-                    procesarTextoDictado(matches[0])
+                    procesarTextoDictado(matches[0], true)
                 }
                 if (isDictationMode) {
                     nativeSpeechRecognizer?.startListening(intent)
@@ -808,7 +891,7 @@ class StudentListFragment : Fragment() {
             override fun onPartialResults(partialResults: Bundle?) {
                 val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                 if (!matches.isNullOrEmpty()) {
-                    procesarTextoDictado(matches[0])
+                    procesarTextoDictado(matches[0], false)
                 }
             }
             override fun onEvent(eventType: Int, params: Bundle?) {}
@@ -826,6 +909,7 @@ class StudentListFragment : Fragment() {
         (requireActivity() as? AppCompatActivity)?.supportActionBar?.title = "GEMINI (Grabando...)"
         btnDictado.setColorFilter(android.graphics.Color.BLUE)
         
+        geminiStartTime = System.currentTimeMillis()
         audioRecorder?.startRecording("gemini_audio")
         actualizarLista()
     }
@@ -836,9 +920,16 @@ class StudentListFragment : Fragment() {
         updateActionBarTitle()
         btnDictado.clearColorFilter()
         
+        val duration = System.currentTimeMillis() - geminiStartTime
         val audioFile = audioRecorder?.stopRecording()
-        if (audioFile != null && audioFile.exists()) {
-            procesarAudioConGemini(audioFile)
+        
+        if (duration > 500) {
+            if (audioFile != null && audioFile.exists()) {
+                procesarAudioConGemini(audioFile)
+            }
+        } else {
+            // Ignorar grabaciones demasiado cortas para ahorrar cuota
+            Log.d("GeminiDictado", "Grabación ignorada por ser demasiado corta ($duration ms)")
         }
         
         actualizarLista()
@@ -849,7 +940,7 @@ class StudentListFragment : Fragment() {
         
         if (generativeModel == null) {
             generativeModel = GenerativeModel(
-                modelName = "gemini-2.0-flash",
+                modelName = "gemini-flash-latest",
                 apiKey = GEMINI_API_KEY
             )
         }
@@ -893,7 +984,9 @@ class StudentListFragment : Fragment() {
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
-                    Toast.makeText(requireContext(), "Error Gemini: ${e.message}", Toast.LENGTH_LONG).show()
+                    if (isAdded) {
+                        Toast.makeText(requireContext(), "Error Gemini: ${e.message}", Toast.LENGTH_LONG).show()
+                    }
                 }
             }
         }
@@ -908,7 +1001,9 @@ class StudentListFragment : Fragment() {
                 if (errors.length() > 0) {
                     emitirSonidoError()
                     val firstErr = errors.getJSONObject(0)
-                    Toast.makeText(requireContext(), "No coincidencia: ${firstErr.optString("query")}", Toast.LENGTH_SHORT).show()
+                    if (isAdded) {
+                        Toast.makeText(requireContext(), "No coincidencia: ${firstErr.optString("query")}", Toast.LENGTH_SHORT).show()
+                    }
                 }
             }
 
@@ -928,7 +1023,7 @@ class StudentListFragment : Fragment() {
                 }
             }
             
-            if (count > 0) {
+            if (count > 0 && isAdded) {
                 Toast.makeText(requireContext(), "Gemini actualizó $count notas", Toast.LENGTH_SHORT).show()
             }
         } catch (e: Exception) {}
@@ -975,7 +1070,7 @@ class StudentListFragment : Fragment() {
                     val text = JSONObject(hypothesis).optString("partial")
                     if (text.isNotEmpty()) {
                         val currentTotal = if (voskFinalBuffer.isEmpty()) text else "${voskFinalBuffer} $text"
-                        procesarTextoDictado(currentTotal)
+                        procesarTextoDictado(currentTotal, false)
                     }
                 }
 
@@ -984,7 +1079,7 @@ class StudentListFragment : Fragment() {
                     if (text.isNotEmpty()) {
                         if (voskFinalBuffer.isNotEmpty()) voskFinalBuffer.append(" ")
                         voskFinalBuffer.append(text)
-                        procesarTextoDictado(voskFinalBuffer.toString())
+                        procesarTextoDictado(voskFinalBuffer.toString(), true)
                     }
                 }
 
@@ -993,7 +1088,7 @@ class StudentListFragment : Fragment() {
                     if (text.isNotEmpty()) {
                         if (voskFinalBuffer.isNotEmpty()) voskFinalBuffer.append(" ")
                         voskFinalBuffer.append(text)
-                        procesarTextoDictado(voskFinalBuffer.toString())
+                        procesarTextoDictado(voskFinalBuffer.toString(), true)
                     }
                 }
 
@@ -1054,7 +1149,7 @@ class StudentListFragment : Fragment() {
         }
     }
 
-    private fun procesarTextoDictado(texto: String) {
+    private fun procesarTextoDictado(texto: String, esFinal: Boolean) {
         if (texto.isEmpty()) return
         
         val wordToNum = mapOf(
@@ -1078,14 +1173,18 @@ class StudentListFragment : Fragment() {
             val query = m.groupValues[1].trim()
             val gradeStr = m.groupValues[2].lowercase()
             
+            // Si el nombre es demasiado corto, probablemente es ruido, lo ignoramos incluso como error
+            if (query.length < 3) {
+                lastMatchEnd = m.range.last
+                continue
+            }
+
             val grade: Double = if (gradeStr.contains(Regex("\\d"))) {
                 gradeStr.replace(',', '.').toDoubleOrNull() ?: continue
             } else {
                 wordToNum[gradeStr]?.toDouble() ?: continue
             }
             
-            if (query.length < 3) continue
-
             val namesList = listaAlumnosOriginal.map { it.nombre }
             val matchResult = FuzzyMatcher.findBestMatch(query, namesList, "name")
             
@@ -1119,11 +1218,12 @@ class StudentListFragment : Fragment() {
                         guardarNotaDictado(gradable, grade)
                         resaltarYDesplazarHacia(bestStudentId)
                         savedMatchesThisSession.add(sessionKey)
-                        lastMatchEnd = m.range.last
                     }
                 }
+                lastMatchEnd = m.range.last
             } else {
-                emitirSonidoError()
+                if (esFinal) emitirSonidoError()
+                lastMatchEnd = m.range.last
             }
         }
         
@@ -1193,7 +1293,9 @@ class StudentListFragment : Fragment() {
             ref.setValue(nuevaNota)
             emitirSonidoExito()
             val msg = if (evalActual.esExtra == 1) "Puntos sumados a ${alumno.nombre}" else "Nota asignada a ${alumno.nombre}"
-            Toast.makeText(requireContext(), msg, Toast.LENGTH_SHORT).show()
+            if (isAdded) {
+                Toast.makeText(requireContext(), msg, Toast.LENGTH_SHORT).show()
+            }
             
             currentDictationMatchId = null
             currentDictationSuggestedGrade = null
@@ -1394,6 +1496,11 @@ class StudentListFragment : Fragment() {
             .withEndAction { fabMenuContainer.visibility = View.GONE }
     }
 
+    override fun onDestroyView() {
+        super.onDestroyView()
+        removeListeners()
+    }
+
     override fun onDestroy() {
         super.onDestroy()
         voskSpeechService?.stop()
@@ -1406,6 +1513,15 @@ class StudentListFragment : Fragment() {
         if (requestCode == RC_AUDIO_PERM && grantResults.isNotEmpty() && grantResults[0] == android.content.pm.PackageManager.PERMISSION_GRANTED) {
             mostrarDialogoGrabacion()
         }
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putString("currentQuery", currentQuery)
+        
+        val seleccion = spinnerEvaluaciones.selectedItem?.toString()
+        val evalActual = evaluaciones.find { getEvalDisplayName(it) == seleccion }
+        outState.putString("selectedEvalId", evalActual?.id)
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {

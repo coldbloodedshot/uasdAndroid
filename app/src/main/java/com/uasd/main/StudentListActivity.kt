@@ -80,6 +80,7 @@ class StudentListActivity : AppCompatActivity() {
         val fragment = getCurrentFragment()
         val deleteItem = menu?.findItem(R.id.action_delete_eval)
         val statsItem = menu?.findItem(R.id.action_stats)
+
         
         // El fragmento decide si mostrar o no las opciones basándose en su estado (spinner selection)
         // Pero como no podemos acceder fácilmente al spinner del fragmento desde aquí de forma síncrona
