@@ -18,6 +18,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var adapter: SeccionAdapter
     private lateinit var recyclerView: RecyclerView
     private lateinit var tvEmpty: TextView
+    private var seccionesListener: ValueEventListener? = null
+    private var seccionesRef: DatabaseReference? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -66,11 +68,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun escucharSecciones() {
-        val seccionesRef = database.child("secciones")
+        seccionesRef = database.child("secciones")
         val detallesRef = database.child("seccion_detalles")
 
         // Escuchar cambios en secciones
-        seccionesRef.addValueEventListener(object : ValueEventListener {
+        seccionesListener = object : ValueEventListener {
             override fun onDataChange( snapshotSecciones: DataSnapshot) {
                 // Escuchar detalles una vez cada vez que cambian las secciones
                 detallesRef.addListenerForSingleValueEvent(object : ValueEventListener {
@@ -101,7 +103,13 @@ class MainActivity : AppCompatActivity() {
             override fun onCancelled(error: DatabaseError) {
                 Toast.makeText(this@MainActivity, "Error al cargar datos: ${error.message}", Toast.LENGTH_SHORT).show()
             }
-        })
+        }
+        seccionesRef?.addValueEventListener(seccionesListener!!)
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        seccionesListener?.let { seccionesRef?.removeEventListener(it) }
     }
 
     private fun actualizarUI(listaSecciones: List<Seccion>) {

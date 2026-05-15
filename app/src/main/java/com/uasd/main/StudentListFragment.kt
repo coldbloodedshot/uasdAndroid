@@ -50,14 +50,18 @@ class StudentListFragment : Fragment() {
         private const val ARG_CODIGO_MATERIA = "codigo_materia"
         private const val ARG_SECCION = "seccion"
         private const val ARG_MATERIA = "materia"
+        private const val ARG_PREV_EVAL_NAME = "prev_eval_name"
+        private const val ARG_WANT_DICTATION = "want_dictation"
 
-        fun newInstance(nrc: String, codigoMateria: String, seccion: String, materia: String): StudentListFragment {
+        fun newInstance(nrc: String, codigoMateria: String, seccion: String, materia: String, prevEvalName: String? = null, wantDictation: Boolean = false): StudentListFragment {
             val fragment = StudentListFragment()
             val args = Bundle()
             args.putString(ARG_NRC, nrc)
             args.putString(ARG_CODIGO_MATERIA, codigoMateria)
             args.putString(ARG_SECCION, seccion)
             args.putString(ARG_MATERIA, materia)
+            args.putString(ARG_PREV_EVAL_NAME, prevEvalName)
+            args.putBoolean(ARG_WANT_DICTATION, wantDictation)
             fragment.arguments = args
             return fragment
         }
@@ -93,6 +97,8 @@ class StudentListFragment : Fragment() {
     private var codigoMateria: String? = null
     private var seccion: String? = null
     private var materia: String? = null
+    private var prevEvalName: String? = null
+    private var wantDictation: Boolean = false
     private var currentQuery: String = ""
     private var pendingSelectEvalId: String? = null
     
@@ -134,6 +140,8 @@ class StudentListFragment : Fragment() {
             codigoMateria = it.getString(ARG_CODIGO_MATERIA)
             seccion = it.getString(ARG_SECCION)
             materia = it.getString(ARG_MATERIA)
+            prevEvalName = it.getString(ARG_PREV_EVAL_NAME)
+            wantDictation = it.getBoolean(ARG_WANT_DICTATION)
         }
         
         savedInstanceState?.let {
@@ -269,6 +277,12 @@ class StudentListFragment : Fragment() {
         }
     }
 
+    fun getSelectedEvalName(): String? {
+        val seleccion = spinnerEvaluaciones.selectedItem?.toString() ?: return null
+        if (seleccion == ACUMULADO_TEXT) return null
+        return evaluaciones.find { getEvalDisplayName(it) == seleccion }?.nombre
+    }
+
     private fun getEvalDisplayName(eval: Evaluacion): String {
         return if (eval.esExtra == 1) eval.nombre else "${eval.nombre} (${eval.valor} pts)"
     }
@@ -330,13 +344,15 @@ class StudentListFragment : Fragment() {
             override fun onDataChange(snapshot: DataSnapshot) {
                 if (!isAdded) return
                 evaluaciones.clear()
-                val nombresEval = mutableListOf(ACUMULADO_TEXT)
+                val tempEval = mutableListOf<Evaluacion>()
                 for (s in snapshot.children) {
-                    s.getValue(Evaluacion::class.java)?.let { 
-                        evaluaciones.add(it)
-                        nombresEval.add(getEvalDisplayName(it))
-                    }
+                    s.getValue(Evaluacion::class.java)?.let { tempEval.add(it) }
                 }
+                tempEval.sortBy { it.nombre }
+                evaluaciones.addAll(tempEval)
+
+                val nombresEval = mutableListOf(ACUMULADO_TEXT)
+                evaluaciones.forEach { nombresEval.add(getEvalDisplayName(it)) }
                 
                 val currentContext = context ?: return
                 val spinnerAdapter = ArrayAdapter(currentContext, android.R.layout.simple_spinner_item, nombresEval)
@@ -355,6 +371,26 @@ class StudentListFragment : Fragment() {
                             pendingSelectEvalId = null
                         }
                     }
+                } else if (prevEvalName != null) {
+                    val match = evaluaciones.find { it.nombre.trim().equals(prevEvalName?.trim(), ignoreCase = true) }
+                    if (match != null) {
+                        val displayName = getEvalDisplayName(match)
+                        val pos = nombresEval.indexOf(displayName)
+                        if (pos != -1) {
+                            spinnerEvaluaciones.setSelection(pos)
+                            
+                            if (wantDictation) {
+                                spinnerEvaluaciones.post {
+                                    if (isAdded && !isDictationMode) {
+                                        iniciarFlujoDictado()
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Importante limpiar para que no se repita en cambios de datos posteriores
+                    prevEvalName = null
+                    wantDictation = false
                 } else if (seleccionActual == null || seleccionActual == ACUMULADO_TEXT) {
                     val targetEval = if (pendingSelectEvalId != null) {
                         evaluaciones.find { it.id == pendingSelectEvalId }
@@ -479,6 +515,16 @@ class StudentListFragment : Fragment() {
                 val ref = database.child("seccion_detalles").child(nrc!!)
                 ref.child("evaluaciones").child(evalActual.id).removeValue()
                 ref.child("notas").child(evalActual.id).removeValue()
+                
+                // Limpiar también en los records individuales de los estudiantes
+                val currentCodigo = codigoMateria
+                if (currentCodigo != null) {
+                    listaAlumnosOriginal.forEach { est ->
+                        database.child("estudiante_records").child(est.matricula)
+                            .child(currentCodigo).child(evalActual.id).removeValue()
+                    }
+                }
+                
                 Toast.makeText(requireContext(), "Evaluación eliminada", Toast.LENGTH_SHORT).show()
             }
             .setNegativeButton("Cancelar", null)
@@ -500,7 +546,9 @@ class StudentListFragment : Fragment() {
             val id = ref.push().key ?: ""
             pendingSelectEvalId = id
             val eval = Evaluacion(id, "PUNTOS EXTRA", 100, 1)
-            ref.child(id).setValue(eval)
+            database.child("seccion_detalles").child(nrc!!).child("evaluaciones").child(id).setValue(eval)
+            // No es estrictamente necesario inicializar el record aquí ya que no hay nota aún,
+            // pero si se quisiera se podría hacer.
         }
     }
 
@@ -585,8 +633,7 @@ class StudentListFragment : Fragment() {
                     prefs.edit().putFloat(KEY_LAST_EXTRA, incremento.toFloat()).apply()
                 }
                 val nuevaNota = notaActual + incremento
-                database.child("seccion_detalles").child(nrc!!)
-                    .child("notas").child(evalActual.id).child(alumno.matricula).setValue(nuevaNota)
+                actualizarNotaEnFirebase(evalActual, alumno.matricula, nuevaNota)
             }
             builder.setNeutralButton("Corregir") { _, _ ->
                 val nuevaNota = etNota.text.toString().toDoubleOrNull() ?: 0.0
@@ -594,8 +641,7 @@ class StudentListFragment : Fragment() {
                     .setTitle("¿Sobrescribir puntos?")
                     .setMessage("Vas a poner $nuevaNota como el total de puntos extra para este estudiante. ¿Estás seguro?")
                     .setPositiveButton("SÍ, SOBRESCRIBIR") { _, _ ->
-                        database.child("seccion_detalles").child(nrc!!)
-                            .child("notas").child(evalActual.id).child(alumno.matricula).setValue(nuevaNota)
+                        actualizarNotaEnFirebase(evalActual, alumno.matricula, nuevaNota)
                     }
                     .setNegativeButton("No", null)
                     .show()
@@ -608,19 +654,18 @@ class StudentListFragment : Fragment() {
                         .child("notas").child(evalActual.id).child(alumno.matricula)
                 
                 if (input.isEmpty()) {
-                    ref.removeValue()
+                    actualizarNotaEnFirebase(evalActual, alumno.matricula, null)
                 } else {
                     val nota = input.toDoubleOrNull() ?: 0.0
                     if (nota <= evalActual.valor) {
-                        ref.setValue(nota)
+                        actualizarNotaEnFirebase(evalActual, alumno.matricula, nota)
                     } else {
                         Toast.makeText(requireContext(), "Error: La nota no puede superar el valor máximo", Toast.LENGTH_SHORT).show()
                     }
                 }
             }
             builder.setNeutralButton("100 %") { _, _ ->
-                database.child("seccion_detalles").child(nrc!!)
-                    .child("notas").child(evalActual.id).child(alumno.matricula).setValue(evalActual.valor.toDouble())
+                actualizarNotaEnFirebase(evalActual, alumno.matricula, evalActual.valor.toDouble())
             }
         }
         
@@ -714,7 +759,11 @@ class StudentListFragment : Fragment() {
         val evalActual = evaluaciones.find { getEvalDisplayName(it) == seleccion } ?: return
         
         val notasMap = todasLasNotas[evalActual.id] ?: emptyMap<String, Double>()
-        val notas = notasMap.values.filter { it >= 0 }
+        
+        // Filtrar para considerar solo alumnos que pertenecen oficialmente a esta sección
+        val matriculasDeEstaSeccion = listaAlumnosOriginal.map { it.matricula }.toSet()
+        val notas = notasMap.filter { matriculasDeEstaSeccion.contains(it.key) }
+                           .values.filter { it >= 0 }
 
         if (notas.isEmpty()) {
             Toast.makeText(requireContext(), "No hay notas registradas para esta evaluación", Toast.LENGTH_SHORT).show()
@@ -1271,11 +1320,8 @@ class StudentListFragment : Fragment() {
         val seleccion = spinnerEvaluaciones.selectedItem?.toString() ?: return
         val evalActual = evaluaciones.find { getEvalDisplayName(it) == seleccion } ?: return
 
-        val ref = database.child("seccion_detalles").child(nrc!!)
-            .child("notas").child(evalActual.id).child(alumno.matricula)
-
         if (nota == null) {
-            ref.removeValue()
+            actualizarNotaEnFirebase(evalActual, alumno.matricula, null)
             currentDictationMatchId = null
             currentDictationSuggestedGrade = null
             actualizarLista()
@@ -1290,7 +1336,7 @@ class StudentListFragment : Fragment() {
         }
 
         if (evalActual.esExtra == 1 || nuevaNota <= evalActual.valor) {
-            ref.setValue(nuevaNota)
+            actualizarNotaEnFirebase(evalActual, alumno.matricula, nuevaNota)
             emitirSonidoExito()
             val msg = if (evalActual.esExtra == 1) "Puntos sumados a ${alumno.nombre}" else "Nota asignada a ${alumno.nombre}"
             if (isAdded) {
@@ -1302,6 +1348,29 @@ class StudentListFragment : Fragment() {
             actualizarLista()
         } else {
             Toast.makeText(requireContext(), "Error: La nota supera el valor máximo (${evalActual.valor})", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun actualizarNotaEnFirebase(eval: Evaluacion, matricula: String, nota: Double?) {
+        val currentNrc = nrc ?: return
+        val currentCodigo = codigoMateria ?: return
+        
+        val refTradicional = database.child("seccion_detalles").child(currentNrc)
+            .child("notas").child(eval.id).child(matricula)
+            
+        val refRecord = database.child("estudiante_records").child(matricula)
+            .child(currentCodigo).child(eval.id)
+
+        if (nota == null) {
+            refTradicional.removeValue()
+            refRecord.removeValue()
+        } else {
+            refTradicional.setValue(nota)
+            val recordMap = mapOf(
+                "nombre" to eval.nombre,
+                "nota" to nota
+            )
+            refRecord.setValue(recordMap)
         }
     }
 
@@ -1503,9 +1572,18 @@ class StudentListFragment : Fragment() {
 
     override fun onDestroy() {
         super.onDestroy()
-        voskSpeechService?.stop()
+        try {
+            voskSpeechService?.stop()
+        } catch (e: Exception) {
+            Log.e("StudentListFragment", "Error stopping Vosk: ${e.message}")
+        }
         voskSpeechService = null
-        nativeSpeechRecognizer?.destroy()
+        
+        try {
+            nativeSpeechRecognizer?.destroy()
+        } catch (e: Exception) {
+            Log.e("StudentListFragment", "Error destroying SpeechRecognizer: ${e.message}")
+        }
         nativeSpeechRecognizer = null
     }
 

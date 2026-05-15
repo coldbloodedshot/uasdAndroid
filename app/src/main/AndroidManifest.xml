@@ -23,7 +23,8 @@
         android:theme="@style/Theme.UasdMain">
         <activity
             android:name=".MainActivity"
-            android:exported="true">
+            android:exported="true"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -33,7 +34,8 @@
         <activity
             android:name=".StudentListActivity"
             android:exported="false"
-            android:label="Lista de Estudiantes" />
+            android:label="Lista de Estudiantes"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize" />
 
         <activity
             android:name=".CalendarActivity"
@@ -43,7 +45,8 @@
         <activity
             android:name=".AttendanceActivity"
             android:exported="false"
-            android:label="Control de Asistencia" />
+            android:label="Control de Asistencia"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize" />
     </application>
 
 </manifest>
