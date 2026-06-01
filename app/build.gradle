@@ -4,6 +4,15 @@ plugins {
     id 'com.google.gms.google-services'
 }
 
+// Cargar archivo local.properties
+def localProperties = new Properties()
+def localPropertiesFile = rootProject.file('local.properties')
+if (localPropertiesFile.exists()) {
+    localPropertiesFile.withReader('UTF-8') { reader ->
+        localProperties.load(reader)
+    }
+}
+
 android {
     namespace 'com.uasd.main'
     compileSdk 34
@@ -16,6 +25,14 @@ android {
         versionName "1.0"
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+
+        // Inyectar API Key de Gemini
+        def geminiApiKey = localProperties.getProperty('gemini.api.key', '')
+        buildConfigField "String", "GEMINI_API_KEY", "\"${geminiApiKey}\""
+    }
+
+    buildFeatures {
+        buildConfig true
     }
 
     buildTypes {

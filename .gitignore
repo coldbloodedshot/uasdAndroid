@@ -27,3 +27,6 @@ layout-rendering-cache.xml
 
 # Windows
 Thumbs.db
+
+# Firebase configuration (Sensitive)
+app/google-services.json

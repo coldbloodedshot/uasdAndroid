@@ -20,15 +20,13 @@ import androidx.fragment.app.Fragment
 import androidx.recyclerview.widget.DividerItemDecoration
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
-import com.google.android.gms.auth.api.signin.GoogleSignIn
-import com.google.android.gms.auth.api.signin.GoogleSignInOptions
-import com.google.android.gms.common.api.Scope
-import com.google.api.services.drive.DriveScopes
 import com.google.firebase.database.*
 import com.google.ai.client.generativeai.GenerativeModel
 import com.google.ai.client.generativeai.type.content
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
@@ -38,9 +36,6 @@ import org.vosk.android.SpeechService
 import org.vosk.android.StorageService
 import java.io.File
 import java.io.FileInputStream
-import java.io.OutputStreamWriter
-import java.net.HttpURLConnection
-import java.net.URL
 import org.vosk.android.RecognitionListener as VoskRecognitionListener
 
 class StudentListFragment : Fragment() {
@@ -52,8 +47,9 @@ class StudentListFragment : Fragment() {
         private const val ARG_MATERIA = "materia"
         private const val ARG_PREV_EVAL_NAME = "prev_eval_name"
         private const val ARG_WANT_DICTATION = "want_dictation"
+        private const val ARG_PREV_QUERY = "prev_query"
 
-        fun newInstance(nrc: String, codigoMateria: String, seccion: String, materia: String, prevEvalName: String? = null, wantDictation: Boolean = false): StudentListFragment {
+        fun newInstance(nrc: String, codigoMateria: String, seccion: String, materia: String, prevEvalName: String? = null, wantDictation: Boolean = false, prevQuery: String? = null): StudentListFragment {
             val fragment = StudentListFragment()
             val args = Bundle()
             args.putString(ARG_NRC, nrc)
@@ -62,14 +58,13 @@ class StudentListFragment : Fragment() {
             args.putString(ARG_MATERIA, materia)
             args.putString(ARG_PREV_EVAL_NAME, prevEvalName)
             args.putBoolean(ARG_WANT_DICTATION, wantDictation)
+            args.putString(ARG_PREV_QUERY, prevQuery)
             fragment.arguments = args
             return fragment
         }
     }
 
-    private val RC_SIGN_IN = 100
     private val RC_AUDIO_PERM = 1001
-    private var pendingAudioFile: File? = null
 
     private lateinit var database: DatabaseReference
     private lateinit var adapter: EstudianteAdapter
@@ -118,6 +113,7 @@ class StudentListFragment : Fragment() {
     private var currentDictationMatchId: String? = null
     private var currentDictationSuggestedGrade: Double? = null
     private var geminiStartTime: Long = 0
+    private var searchJob: Job? = null
     
     private val PREFS_NAME = "uasd_prefs"
     private val KEY_LAST_EXTRA = "last_extra_points"
@@ -133,6 +129,24 @@ class StudentListFragment : Fragment() {
     
     private val ACUMULADO_TEXT = "--- Acumulado Total ---"
 
+    interface OnSearchListener {
+        fun onEmptySearch(query: String)
+        fun onSearchCleared()
+    }
+    var searchListener: OnSearchListener? = null
+
+    override fun onAttach(context: Context) {
+        super.onAttach(context)
+        if (context is OnSearchListener) {
+            searchListener = context
+        }
+    }
+
+    override fun onDetach() {
+        super.onDetach()
+        searchListener = null
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         arguments?.let {
@@ -142,6 +156,10 @@ class StudentListFragment : Fragment() {
             materia = it.getString(ARG_MATERIA)
             prevEvalName = it.getString(ARG_PREV_EVAL_NAME)
             wantDictation = it.getBoolean(ARG_WANT_DICTATION)
+            val prevQ = it.getString(ARG_PREV_QUERY)
+            if (prevQ != null && currentQuery.isEmpty()) {
+                currentQuery = prevQ
+            }
         }
         
         savedInstanceState?.let {
@@ -283,6 +301,8 @@ class StudentListFragment : Fragment() {
         return evaluaciones.find { getEvalDisplayName(it) == seleccion }?.nombre
     }
 
+    fun getCurrentSearchQuery(): String = currentQuery
+
     private fun getEvalDisplayName(eval: Evaluacion): String {
         return if (eval.esExtra == 1) eval.nombre else "${eval.nombre} (${eval.valor} pts)"
     }
@@ -387,10 +407,14 @@ class StudentListFragment : Fragment() {
                                 }
                             }
                         }
+                        // Solo limpiamos si encontramos la coincidencia
+                        prevEvalName = null
+                        wantDictation = false
+                    } else if (evaluaciones.isNotEmpty()) {
+                        // Si ya cargaron evaluaciones pero ninguna coincide, limpiamos prevEvalName
+                        prevEvalName = null
+                        wantDictation = false
                     }
-                    // Importante limpiar para que no se repita en cambios de datos posteriores
-                    prevEvalName = null
-                    wantDictation = false
                 } else if (seleccionActual == null || seleccionActual == ACUMULADO_TEXT) {
                     val targetEval = if (pendingSelectEvalId != null) {
                         evaluaciones.find { it.id == pendingSelectEvalId }
@@ -501,6 +525,16 @@ class StudentListFragment : Fragment() {
         }
         
         adapter.updateData(listaMostrable.sortedBy { it.nombre })
+        
+        searchJob?.cancel()
+        if (currentQuery.isNotEmpty() && listaMostrable.isEmpty()) {
+            searchJob = CoroutineScope(Dispatchers.Main).launch {
+                delay(300)
+                searchListener?.onEmptySearch(currentQuery)
+            }
+        } else {
+            searchListener?.onSearchCleared()
+        }
     }
 
     fun mostrarDialogoEliminarEvaluacion() {
@@ -556,19 +590,59 @@ class StudentListFragment : Fragment() {
         val view = LayoutInflater.from(requireContext()).inflate(R.layout.dialog_evaluacion, null)
         val etNombre = view.findViewById<EditText>(R.id.etNombreEval)
         val etValor = view.findViewById<EditText>(R.id.etValorEval)
+        val cbCrearOtrasSecciones = view.findViewById<CheckBox>(R.id.cbCrearOtrasSecciones)
 
         AlertDialog.Builder(requireContext())
             .setTitle("Nueva Evaluación")
             .setView(view)
             .setPositiveButton("Guardar") { _, _ ->
-                val nombre = etNombre.text.toString()
+                val nombre = etNombre.text.toString().trim()
                 val valor = etValor.text.toString().toIntOrNull() ?: 0
                 val currentNrc = nrc
+                val currentCodigoMateria = codigoMateria
                 if (nombre.isNotEmpty() && valor > 0 && currentNrc != null) {
                     val id = database.child("seccion_detalles").child(currentNrc).child("evaluaciones").push().key ?: ""
                     pendingSelectEvalId = id
                     val eval = Evaluacion(id, nombre, valor, 0)
                     database.child("seccion_detalles").child(currentNrc).child("evaluaciones").child(id).setValue(eval)
+
+                    if (cbCrearOtrasSecciones.isChecked) {
+                        database.child("secciones").addListenerForSingleValueEvent(object : ValueEventListener {
+                            override fun onDataChange(snapshotSecciones: DataSnapshot) {
+                                for (seccionSnapshot in snapshotSecciones.children) {
+                                    val seccion = seccionSnapshot.getValue(Seccion::class.java) ?: continue
+                                    val otherNrc = seccion.nrc
+                                    val otherCodigoMateria = seccion.codigoMateria
+                                    if (otherNrc.isNotEmpty() && otherNrc != currentNrc && otherCodigoMateria == currentCodigoMateria) {
+                                        database.child("seccion_detalles").child(otherNrc).child("evaluaciones")
+                                            .addListenerForSingleValueEvent(object : ValueEventListener {
+                                                override fun onDataChange(snapshotEvaluaciones: DataSnapshot) {
+                                                    var alreadyExists = false
+                                                    for (evalSnapshot in snapshotEvaluaciones.children) {
+                                                        val existingEval = evalSnapshot.getValue(Evaluacion::class.java) ?: continue
+                                                        if (existingEval.nombre.trim().equals(nombre, ignoreCase = true)) {
+                                                            alreadyExists = true
+                                                            break
+                                                        }
+                                                    }
+                                                    if (!alreadyExists) {
+                                                        val newId = database.child("seccion_detalles").child(otherNrc).child("evaluaciones").push().key ?: ""
+                                                        val newEval = Evaluacion(newId, nombre, valor, 0)
+                                                        database.child("seccion_detalles").child(otherNrc).child("evaluaciones").child(newId).setValue(newEval)
+                                                    }
+                                                }
+                                                override fun onCancelled(error: DatabaseError) {
+                                                    Log.e("StudentListFragment", "Error checking evaluations for section $otherNrc: ${error.message}")
+                                                }
+                                            })
+                                    }
+                                }
+                            }
+                            override fun onCancelled(error: DatabaseError) {
+                                Log.e("StudentListFragment", "Error fetching sections: ${error.message}")
+                            }
+                        })
+                    }
                 }
             }
             .setNegativeButton("Cancelar", null)
@@ -985,7 +1059,7 @@ class StudentListFragment : Fragment() {
     }
 
     private fun procesarAudioConGemini(audioFile: File) {
-        val GEMINI_API_KEY = "AIzaSyCqE6brL3uq0mP3YVgRc9QmGDUvgHzJNaY"
+        val GEMINI_API_KEY = BuildConfig.GEMINI_API_KEY
         
         if (generativeModel == null) {
             generativeModel = GenerativeModel(
@@ -1374,167 +1448,6 @@ class StudentListFragment : Fragment() {
         }
     }
 
-    fun mostrarDialogoGrabacion() {
-        val layout = LinearLayout(requireContext())
-        layout.orientation = LinearLayout.VERTICAL
-        layout.setPadding(50, 50, 50, 50)
-        layout.gravity = android.view.Gravity.CENTER
-
-        val statusText = TextView(requireContext())
-        statusText.text = "Presiona GRABAR para iniciar"
-        statusText.textSize = 18f
-        statusText.gravity = android.view.Gravity.CENTER
-        layout.addView(statusText)
-
-        val recorder = AudioRecorder(requireContext())
-        var isRecording = false
-        var fileToUpload: File? = null
-
-        val builder = AlertDialog.Builder(requireContext())
-            .setTitle("Dictado de Notas")
-            .setView(layout)
-            .setPositiveButton("Enviar") { _, _ -> 
-                if (fileToUpload != null) {
-                    pendingAudioFile = fileToUpload
-                    requestDriveSignIn()
-                }
-            }
-            .setNegativeButton("Cancelar", null)
-            .setNeutralButton("GRABAR") { _, _ -> }
-
-        val dialog = builder.create()
-        dialog.show()
-
-        val btnAction = dialog.getButton(AlertDialog.BUTTON_NEUTRAL)
-        btnAction.setOnClickListener {
-            if (!isRecording) {
-                val codigo = codigoMateria ?: "MAT"
-                val sec = seccion ?: "SEC"
-                val evalName = spinnerEvaluaciones.selectedItem?.toString() ?: "Eval"
-                val safeName = "${codigo}_${sec}_${evalName}".replace(Regex("[^a-zA-Z0-9._-]"), "_")
-                
-                if (recorder.startRecording(safeName)) {
-                    isRecording = true
-                    statusText.text = "GRABANDO... (Hable ahora)"
-                    statusText.setTextColor(android.graphics.Color.RED)
-                    btnAction.text = "DETENER"
-                    dialog.getButton(AlertDialog.BUTTON_POSITIVE).isEnabled = false
-                }
-            } else {
-                fileToUpload = recorder.stopRecording()
-                isRecording = false
-                statusText.text = "Grabación finalizada.\nListo para enviar."
-                statusText.setTextColor(android.graphics.Color.BLACK)
-                btnAction.text = "GRABAR DE NUEVO"
-                dialog.getButton(AlertDialog.BUTTON_POSITIVE).isEnabled = true
-            }
-        }
-        dialog.getButton(AlertDialog.BUTTON_POSITIVE).isEnabled = false
-    }
-
-    private fun requestDriveSignIn() {
-        val signInOptions = GoogleSignInOptions.Builder(GoogleSignInOptions.DEFAULT_SIGN_IN)
-            .requestEmail()
-            .requestScopes(Scope(DriveScopes.DRIVE))
-            .build()
-        val client = GoogleSignIn.getClient(requireActivity(), signInOptions)
-        client.signOut().addOnCompleteListener {
-            startActivityForResult(client.signInIntent, RC_SIGN_IN)
-        }
-    }
-
-    private fun uploadAudioToDrive(account: com.google.android.gms.auth.api.signin.GoogleSignInAccount, file: File) {
-        val layout = LinearLayout(requireContext())
-        layout.orientation = LinearLayout.HORIZONTAL
-        layout.setPadding(50, 50, 50, 50)
-        layout.gravity = android.view.Gravity.CENTER_VERTICAL
-        
-        val progressBar = ProgressBar(requireContext())
-        progressBar.isIndeterminate = true
-        layout.addView(progressBar)
-        
-        val tvMessage = TextView(requireContext())
-        tvMessage.text = "Subiendo audio a Drive..."
-        tvMessage.textSize = 16f
-        tvMessage.setPadding(30, 0, 0, 0)
-        layout.addView(tvMessage)
-
-        val loadingDialog = AlertDialog.Builder(requireContext())
-            .setView(layout)
-            .setCancelable(false)
-            .create()
-            
-        loadingDialog.show()
-
-        CoroutineScope(Dispatchers.IO).launch {
-            try {
-                val driveService = DriveServiceHelper.getDriveService(requireContext(), account)
-                val folderId = driveService.createFolderIfNotExist("UASD_Audios_Notas")
-                val fileId = driveService.uploadFile(file, "audio/mp4", folderId)
-                
-                withContext(Dispatchers.Main) {
-                   tvMessage.text = "Audio subido. Conectando con IA..."
-                }
-
-                triggerAppsScript(fileId)
-
-                withContext(Dispatchers.Main) {
-                    loadingDialog.dismiss()
-                    Toast.makeText(requireContext(), "¡Proceso terminado!", Toast.LENGTH_SHORT).show()
-                }
-            } catch (e: Exception) {
-                withContext(Dispatchers.Main) {
-                    loadingDialog.dismiss()
-                    Toast.makeText(requireContext(), "Error: ${e.message}", Toast.LENGTH_LONG).show()
-                }
-            }
-        }
-    }
-
-    private suspend fun triggerAppsScript(fileId: String) {
-        val scriptUrl = "https://script.google.com/macros/s/AKfycby3fFmVkTDTBSM9ETL6LypetMhoeQGiNyJTSNeZ5lwkh4RmuWlfPBEHzPggGtcwGg0D/exec"
-        
-        try {
-            val url = URL(scriptUrl)
-            val conn = url.openConnection() as HttpURLConnection
-            conn.requestMethod = "POST"
-            conn.doOutput = true
-            conn.setRequestProperty("Content-Type", "application/json")
-            conn.connectTimeout = 90000
-            conn.readTimeout = 90000
-
-            val selectedName = spinnerEvaluaciones.selectedItem?.toString() ?: ""
-            val evalActual = evaluaciones.find { getEvalDisplayName(it) == selectedName }
-            val evalIdToSend = evalActual?.id ?: selectedName
-
-            val jsonParam = JSONObject()
-            jsonParam.put("fileId", fileId)
-            jsonParam.put("evalColumn", evalIdToSend) 
-            jsonParam.put("nrc", nrc)
-
-            val os = OutputStreamWriter(conn.outputStream)
-            os.write(jsonParam.toString())
-            os.flush()
-            os.close()
-
-            val responseCode = conn.responseCode
-            if (responseCode != 200 && responseCode != 302) {
-                 withContext(Dispatchers.Main) {
-                     Toast.makeText(requireContext(), "Script falló: $responseCode", Toast.LENGTH_LONG).show()
-                 }
-            } else {
-                 withContext(Dispatchers.Main) {
-                     Toast.makeText(requireContext(), "¡Notas procesadas! Actualizando...", Toast.LENGTH_SHORT).show()
-                 }
-            }
-
-        } catch (e: Exception) {
-             withContext(Dispatchers.Main) {
-                 Toast.makeText(requireContext(), "Error de red: ${e.message}", Toast.LENGTH_LONG).show()
-             }
-        }
-    }
-
     private fun toggleFabMenu() {
         if (!isFabOpen) {
             showFabMenu()
@@ -1587,11 +1500,7 @@ class StudentListFragment : Fragment() {
         nativeSpeechRecognizer = null
     }
 
-    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
-        if (requestCode == RC_AUDIO_PERM && grantResults.isNotEmpty() && grantResults[0] == android.content.pm.PackageManager.PERMISSION_GRANTED) {
-            mostrarDialogoGrabacion()
-        }
-    }
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {}
 
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
@@ -1600,19 +1509,5 @@ class StudentListFragment : Fragment() {
         val seleccion = spinnerEvaluaciones.selectedItem?.toString()
         val evalActual = evaluaciones.find { getEvalDisplayName(it) == seleccion }
         outState.putString("selectedEvalId", evalActual?.id)
-    }
-
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == RC_SIGN_IN) {
-            if (resultCode == AppCompatActivity.RESULT_OK && data != null) {
-                val task = GoogleSignIn.getSignedInAccountFromIntent(data)
-                task.addOnSuccessListener { account ->
-                    if (pendingAudioFile != null) {
-                        uploadAudioToDrive(account, pendingAudioFile!!)
-                    }
-                }
-            }
-        }
     }
 }
