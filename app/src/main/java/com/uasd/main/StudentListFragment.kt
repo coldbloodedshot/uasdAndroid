@@ -336,10 +336,8 @@ class StudentListFragment : Fragment() {
             }
         }
         
-        val prefs = requireContext().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        if (prefs.getString(KEY_DICTATION_MODE, MODE_VOSK) == MODE_VOSK) {
-            initVoskModel()
-        }
+        // Vosk model initialization is now loaded lazily inside iniciarFlujoDictado / empezarDictadoVosk
+        // to prevent UI freezing and heavy memory load when switching sections.
     }
 
     fun getSelectedEvalName(): String? {
