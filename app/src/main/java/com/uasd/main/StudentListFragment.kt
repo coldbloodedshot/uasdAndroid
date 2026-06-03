@@ -291,7 +291,7 @@ class StudentListFragment : Fragment() {
                 btnToggleOrden.setImageResource(imageRes)
             }
 
-            cargarDatos()
+            // Data loading is triggered automatically by ViewModel's init block.
             
             spinnerEvaluaciones.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
                 override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
