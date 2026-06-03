@@ -99,11 +99,6 @@ class StudentListFragment : Fragment() {
     private var currentQuery: String = ""
     private var pendingSelectEvalId: String? = null
     
-    private var estudiantesListener: ValueEventListener? = null
-    private var evaluacionesListener: ValueEventListener? = null
-    private var notasListener: ValueEventListener? = null
-    private var observacionesListener: ValueEventListener? = null
-    
     private var voskModel: Model? = null
     private var voskSpeechService: SpeechService? = null
     private var nativeSpeechRecognizer: SpeechRecognizer? = null
@@ -387,151 +382,9 @@ class StudentListFragment : Fragment() {
         return false
     }
 
-    private fun cargarDatos() {
-        val pathDetalles = database.child("seccion_detalles").child(nrc!!)
-        
-        removeListeners() // Limpiar si ya había alguno
+    // Database listeners are managed inside the StudentListViewModel to prevent leaks and double fetches.
 
-        estudiantesListener = object : ValueEventListener {
-            override fun onDataChange(snapshot: DataSnapshot) {
-                if (!isAdded) return
-                listaAlumnosOriginal.clear()
-                for (s in snapshot.children) {
-                    s.getValue(Estudiante::class.java)?.let { listaAlumnosOriginal.add(it) }
-                }
-                actualizarLista()
-            }
-            override fun onCancelled(error: DatabaseError) {}
-        }
-        pathDetalles.child("estudiantes").addValueEventListener(estudiantesListener!!)
-
-        evaluacionesListener = object : ValueEventListener {
-            override fun onDataChange(snapshot: DataSnapshot) {
-                if (!isAdded) return
-                evaluaciones.clear()
-                val tempEval = mutableListOf<Evaluacion>()
-                for (s in snapshot.children) {
-                    s.getValue(Evaluacion::class.java)?.let { tempEval.add(it) }
-                }
-                tempEval.sortBy { it.nombre }
-                evaluaciones.addAll(tempEval)
-
-                val nombresEval = mutableListOf(ACUMULADO_TEXT)
-                evaluaciones.forEach { nombresEval.add(getEvalDisplayName(it)) }
-                
-                val currentContext = context ?: return
-                val spinnerAdapter = ArrayAdapter(currentContext, android.R.layout.simple_spinner_item, nombresEval)
-                spinnerAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
-                spinnerEvaluaciones.adapter = spinnerAdapter
-
-                val seleccionActual = spinnerEvaluaciones.selectedItem?.toString()
-                
-                if (pendingSelectEvalId != null) {
-                    val targetEval = evaluaciones.find { it.id == pendingSelectEvalId }
-                    if (targetEval != null) {
-                        val displayName = getEvalDisplayName(targetEval)
-                        val pos = nombresEval.indexOf(displayName)
-                        if (pos != -1) {
-                            spinnerEvaluaciones.setSelection(pos)
-                            pendingSelectEvalId = null
-                        }
-                    }
-                } else if (prevEvalName != null) {
-                    val match = evaluaciones.find { it.nombre.trim().equals(prevEvalName?.trim(), ignoreCase = true) }
-                    if (match != null) {
-                        val displayName = getEvalDisplayName(match)
-                        val pos = nombresEval.indexOf(displayName)
-                        if (pos != -1) {
-                            spinnerEvaluaciones.setSelection(pos)
-                            
-                            if (wantDictation) {
-                                spinnerEvaluaciones.post {
-                                    if (isAdded && !isDictationMode) {
-                                        iniciarFlujoDictado()
-                                    }
-                                }
-                            }
-                        }
-                        // Solo limpiamos si encontramos la coincidencia
-                        prevEvalName = null
-                        wantDictation = false
-                    } else if (evaluaciones.isNotEmpty()) {
-                        // Si ya cargaron evaluaciones pero ninguna coincide, limpiamos prevEvalName
-                        prevEvalName = null
-                        wantDictation = false
-                    }
-                } else if (seleccionActual == null || seleccionActual == ACUMULADO_TEXT) {
-                    val targetEval = if (pendingSelectEvalId != null) {
-                        evaluaciones.find { it.id == pendingSelectEvalId }
-                    } else {
-                        evaluaciones.find { it.esExtra == 1 }
-                    }
-                    
-                    if (targetEval != null) {
-                        val displayName = getEvalDisplayName(targetEval)
-                        val pos = nombresEval.indexOf(displayName)
-                        if (pos != -1) {
-                            spinnerEvaluaciones.setSelection(pos)
-                            pendingSelectEvalId = null
-                        }
-                    }
-                }
-            }
-            override fun onCancelled(error: DatabaseError) {}
-        }
-        pathDetalles.child("evaluaciones").addValueEventListener(evaluacionesListener!!)
-
-        notasListener = object : ValueEventListener {
-            override fun onDataChange(snapshot: DataSnapshot) {
-                if (!isAdded) return
-                todasLasNotas.clear()
-                for (evalSnapshot in snapshot.children) {
-                    val evalId = evalSnapshot.key ?: continue
-                    val notasMap = mutableMapOf<String, Double>()
-                    for (notaSnapshot in evalSnapshot.children) {
-                        val matricula = notaSnapshot.key ?: continue
-                        val notaRegistro = NotaRegistro.fromSnapshot(notaSnapshot)
-                        if (notaRegistro != null) {
-                            notasMap[matricula] = notaRegistro.nota
-                        }
-                    }
-                    todasLasNotas[evalId] = notasMap
-                }
-                actualizarLista()
-            }
-            override fun onCancelled(error: DatabaseError) {}
-        }
-        pathDetalles.child("notas").addValueEventListener(notasListener!!)
-
-        observacionesListener = object : ValueEventListener {
-            override fun onDataChange(snapshot: DataSnapshot) {
-                if (!isAdded) return
-                observacionesMap.clear()
-                for (s in snapshot.children) {
-                    val mat = s.key ?: continue
-                    val nota = s.getValue(String::class.java) ?: ""
-                    observacionesMap[mat] = nota
-                }
-                actualizarLista()
-            }
-            override fun onCancelled(error: DatabaseError) {}
-        }
-        pathDetalles.child("observaciones").addValueEventListener(observacionesListener!!)
-    }
-
-    private fun removeListeners() {
-        if (nrc == null) return
-        val pathDetalles = database.child("seccion_detalles").child(nrc!!)
-        estudiantesListener?.let { pathDetalles.child("estudiantes").removeEventListener(it) }
-        evaluacionesListener?.let { pathDetalles.child("evaluaciones").removeEventListener(it) }
-        notasListener?.let { pathDetalles.child("notas").removeEventListener(it) }
-        observacionesListener?.let { pathDetalles.child("observaciones").removeEventListener(it) }
-        
-        estudiantesListener = null
-        evaluacionesListener = null
-        notasListener = null
-        observacionesListener = null
-    }
+    // Note: LiveData observers are cleaned up by viewLifecycleOwner automatically.
 
     private fun actualizarLista() {
         if (!isAdded) return
@@ -1475,7 +1328,6 @@ class StudentListFragment : Fragment() {
 
     override fun onDestroyView() {
         super.onDestroyView()
-        removeListeners()
     }
 
     override fun onDestroy() {
