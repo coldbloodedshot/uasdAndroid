@@ -20,4 +20,12 @@
         android:inputType="number"
         android:layout_marginTop="10dp" />
 
+    <CheckBox
+        android:id="@+id/cbCrearOtrasSecciones"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Crear también en las demás secciones"
+        android:checked="false"
+        android:layout_marginTop="10dp" />
+
 </LinearLayout>

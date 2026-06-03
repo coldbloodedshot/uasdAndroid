@@ -73,10 +73,14 @@ class SeccionAdapter(
     }
 
     private fun convertTo24h(timeStr: String): String {
-        val sdf12 = java.text.SimpleDateFormat("h:mm a", java.util.Locale.US)
-        val sdf24 = java.text.SimpleDateFormat("HH:mm", java.util.Locale.US)
-        val date = sdf12.parse(timeStr.trim())
-        return sdf24.format(date)
+        return try {
+            val sdf12 = java.text.SimpleDateFormat("h:mm a", java.util.Locale.US)
+            val sdf24 = java.text.SimpleDateFormat("HH:mm", java.util.Locale.US)
+            val date = sdf12.parse(timeStr.trim())
+            if (date != null) sdf24.format(date) else "00:00"
+        } catch (e: Exception) {
+            "00:00"
+        }
     }
 
     override fun getItemCount(): Int = secciones.size

@@ -8,8 +8,15 @@ import android.widget.LinearLayout
 import androidx.appcompat.app.AppCompatActivity
 import androidx.fragment.app.Fragment
 import com.google.android.material.button.MaterialButton
+import com.google.firebase.database.DataSnapshot
+import com.google.firebase.database.DatabaseError
+import com.google.firebase.database.FirebaseDatabase
+import com.google.firebase.database.ValueEventListener
 
-class StudentListActivity : AppCompatActivity() {
+class StudentListActivity : AppCompatActivity(), StudentListFragment.OnSearchListener {
+
+    private val searchQueries = mutableMapOf<Int, ValueEventListener>()
+    private val database = FirebaseDatabase.getInstance().reference
 
     private lateinit var containerSecciones: LinearLayout
     private lateinit var secciones: List<Seccion>
@@ -97,10 +104,11 @@ class StudentListActivity : AppCompatActivity() {
         val currentFrag = getCurrentFragment()
         val prevEvalName = currentFrag?.getSelectedEvalName()
         val wasDictating = currentFrag?.isDictationMode == true
+        val prevQuery = currentFrag?.getCurrentSearchQuery()
 
         val fragment = StudentListFragment.newInstance(
             s.nrc, s.codigoMateria, s.claveSeccion, s.nombreMateria,
-            prevEvalName, wasDictating
+            prevEvalName, wasDictating, prevQuery
         )
         supportFragmentManager.beginTransaction()
             .replace(R.id.fragmentContainer, fragment, "current_fragment")
@@ -129,12 +137,61 @@ class StudentListActivity : AppCompatActivity() {
     private fun highlightButton(index: Int) {
         for (i in 0 until containerSecciones.childCount) {
             val btn = containerSecciones.getChildAt(i) as? MaterialButton
+            btn?.backgroundTintList = android.content.res.ColorStateList.valueOf(android.graphics.Color.TRANSPARENT)
             if (i == index) {
                 btn?.alpha = 1.0f
                 btn?.setStrokeWidth(4)
             } else {
                 btn?.alpha = 0.6f
                 btn?.setStrokeWidth(0)
+            }
+        }
+    }
+
+    override fun onEmptySearch(query: String) {
+        clearSearchListeners()
+        secciones.forEachIndexed { index, seccion ->
+            if (index != selectedIndex) {
+                val ref = database.child("seccion_detalles").child(seccion.nrc).child("estudiantes")
+                val listener = object : ValueEventListener {
+                    override fun onDataChange(snapshot: DataSnapshot) {
+                        var found = false
+                        for (s in snapshot.children) {
+                            val est = s.getValue(Estudiante::class.java)
+                            if (est != null && (est.nombre.contains(query, ignoreCase = true) || est.matricula.contains(query))) {
+                                found = true
+                                break
+                            }
+                        }
+                        
+                        val btn = containerSecciones.getChildAt(index) as? MaterialButton
+                        if (found) {
+                            btn?.backgroundTintList = android.content.res.ColorStateList.valueOf(android.graphics.Color.parseColor("#FF9800"))
+                        } else {
+                            btn?.backgroundTintList = android.content.res.ColorStateList.valueOf(android.graphics.Color.TRANSPARENT)
+                        }
+                    }
+                    override fun onCancelled(error: DatabaseError) {}
+                }
+                searchQueries[index] = listener
+                ref.addListenerForSingleValueEvent(listener)
+            }
+        }
+    }
+
+    override fun onSearchCleared() {
+        clearSearchHighlights()
+    }
+
+    private fun clearSearchListeners() {
+        searchQueries.clear()
+    }
+
+    private fun clearSearchHighlights() {
+        for (i in 0 until containerSecciones.childCount) {
+            if (i != selectedIndex) {
+                val btn = containerSecciones.getChildAt(i) as? MaterialButton
+                btn?.backgroundTintList = android.content.res.ColorStateList.valueOf(android.graphics.Color.TRANSPARENT)
             }
         }
     }
@@ -146,11 +203,9 @@ class StudentListActivity : AppCompatActivity() {
     }
 
     override fun onPrepareOptionsMenu(menu: Menu?): Boolean {
-        // El fragmento decide si mostrar o no las opciones basándose en su estado (spinner selection)
-        // Pero como no podemos acceder fácilmente al spinner del fragmento desde aquí de forma síncrona
-        // Simplemente dejamos que el fragmento maneje el click o lo delegamos.
-        // En este caso, para simplificar, dejaremos que el Activity maneje el click llamando al fragmento.
-        
+        val mostrarOpcionesEval = getCurrentFragment()?.tieneEvaluacionIndividualSeleccionada() == true
+        menu?.findItem(R.id.action_edit_eval_name)?.isVisible = mostrarOpcionesEval
+        menu?.findItem(R.id.action_delete_eval)?.isVisible = mostrarOpcionesEval
         return super.onPrepareOptionsMenu(menu)
     }
 
@@ -160,6 +215,10 @@ class StudentListActivity : AppCompatActivity() {
         return when (item.itemId) {
             android.R.id.home -> {
                 onSupportNavigateUp()
+                true
+            }
+            R.id.action_edit_eval_name -> {
+                fragment.mostrarDialogoEditarNombreEvaluacion()
                 true
             }
             R.id.action_delete_eval -> {

@@ -83,6 +83,9 @@ dependencies {
     }
     implementation 'com.google.auth:google-auth-library-oauth2-http:1.19.0'
 
+    // Lifecycle (for lifecycleScope)
+    implementation 'androidx.lifecycle:lifecycle-runtime-ktx:2.6.1'
+
     // Coroutines
     implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.6.4'
     implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.6.4'

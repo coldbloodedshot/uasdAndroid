@@ -1,5 +1,4 @@
 package com.uasd.main
-
 import android.content.Context
 import android.content.Intent
 import android.media.AudioManager
@@ -73,7 +72,10 @@ class StudentListFragment : Fragment() {
     private lateinit var etSearch: EditText
     private lateinit var ivClearSearch: ImageView
     private lateinit var btnDictado: ImageButton
+    private lateinit var btnToggleOrden: ImageButton
     
+    private lateinit var viewModel: StudentListViewModel
+    private lateinit var repository: GradeRepository
     private val savedMatchesThisSession = mutableSetOf<String>()
     
     private lateinit var fabMain: com.google.android.material.floatingactionbutton.FloatingActionButton
@@ -214,7 +216,7 @@ class StudentListFragment : Fragment() {
         recyclerView.layoutManager = LinearLayoutManager(requireContext())
         recyclerView.addItemDecoration(DividerItemDecoration(requireContext(), DividerItemDecoration.VERTICAL))
         
-        adapter = EstudianteAdapter(emptyList(), false, { alumno ->
+        adapter = EstudianteAdapter(emptyList(), false, false, { alumno ->
             if (spinnerEvaluaciones.selectedItem?.toString() != ACUMULADO_TEXT) {
                 mostrarDialogoNota(alumno)
             } else {
@@ -262,12 +264,56 @@ class StudentListFragment : Fragment() {
             gestionarPuntosExtra() 
         }
 
+        btnToggleOrden = view.findViewById(R.id.btnToggleOrden)
+        btnToggleOrden.setOnClickListener {
+            viewModel.alternarOrdenLista()
+        }
+
         if (nrc != null) {
             database = FirebaseDatabase.getInstance().reference
+            repository = GradeRepository(database)
+            viewModel = StudentListViewModel(repository, nrc!!, codigoMateria ?: "")
+            
+            viewModel.estudiantes.observe(viewLifecycleOwner) { lista ->
+                adapter.updateData(lista)
+                // If there's a pending highlighted student, scroll to them now that the list has been updated and reordered
+                adapter.highlightedStudentId?.let { matricula ->
+                    val index = lista.indexOfFirst { it.matricula == matricula }
+                    if (index != -1) {
+                        recyclerView.post {
+                            recyclerView.smoothScrollToPosition(index)
+                        }
+                    }
+                }
+            }
+            
+            viewModel.ordenLista.observe(viewLifecycleOwner) { orden ->
+                val imageRes = if (orden == OrdenListaEstudiantes.FECHA_EDICION) {
+                    android.R.drawable.ic_menu_sort_alphabetically
+                } else {
+                    android.R.drawable.ic_menu_sort_by_size
+                }
+                btnToggleOrden.setImageResource(imageRes)
+            }
+
             cargarDatos()
             
             spinnerEvaluaciones.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
                 override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                    val sel = spinnerEvaluaciones.selectedItem?.toString() ?: ACUMULADO_TEXT
+                    viewModel.setSelectedEvalName(sel)
+                    
+                    // Show or hide sort button based on selection (only active for individual evaluations, not total cumulative)
+                    if (sel == ACUMULADO_TEXT) {
+                        btnToggleOrden.visibility = View.GONE
+                        adapter.mostrarOrdenCaptura = false
+                    } else {
+                        btnToggleOrden.visibility = View.VISIBLE
+                        viewModel.ordenLista.value?.let {
+                            adapter.mostrarOrdenCaptura = (it == OrdenListaEstudiantes.FECHA_EDICION)
+                        }
+                    }
+                    
                     actualizarLista()
                     activity?.invalidateOptionsMenu()
                 }
@@ -279,6 +325,7 @@ class StudentListFragment : Fragment() {
                 override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
                     currentQuery = s?.toString() ?: ""
                     ivClearSearch.visibility = if (currentQuery.isEmpty()) View.GONE else View.VISIBLE
+                    viewModel.setSearchQuery(currentQuery)
                     actualizarLista()
                 }
                 override fun afterTextChanged(s: android.text.Editable?) {}
@@ -445,8 +492,10 @@ class StudentListFragment : Fragment() {
                     val notasMap = mutableMapOf<String, Double>()
                     for (notaSnapshot in evalSnapshot.children) {
                         val matricula = notaSnapshot.key ?: continue
-                        val valor = notaSnapshot.getValue(Double::class.java) ?: 0.0
-                        notasMap[matricula] = valor
+                        val notaRegistro = NotaRegistro.fromSnapshot(notaSnapshot)
+                        if (notaRegistro != null) {
+                            notasMap[matricula] = notaRegistro.nota
+                        }
                     }
                     todasLasNotas[evalId] = notasMap
                 }
@@ -488,46 +537,9 @@ class StudentListFragment : Fragment() {
 
     private fun actualizarLista() {
         if (!isAdded) return
-        val seleccion = spinnerEvaluaciones.selectedItem?.toString() ?: return
-        val listaMostrable = mutableListOf<GradableEstudiante>()
-        
-        val alumnosFiltrados = if (currentQuery.isEmpty()) {
-            listaAlumnosOriginal
-        } else {
-            listaAlumnosOriginal.filter { 
-                it.nombre.contains(currentQuery, ignoreCase = true) || 
-                it.matricula.contains(currentQuery)
-            }
-        }
-
-        if (seleccion == ACUMULADO_TEXT) {
-            alumnosFiltrados.forEach { est ->
-                var total = 0.0
-                var hasAnyGrade = false
-                todasLasNotas.values.forEach { notasMap ->
-                    if (notasMap.containsKey(est.matricula)) {
-                        total += (notasMap[est.matricula] ?: 0.0)
-                        hasAnyGrade = true
-                    }
-                }
-                val displayedNota = if (hasAnyGrade) total else -1.0
-                listaMostrable.add(GradableEstudiante(est.matricula, est.nombre, displayedNota, true, observacionesMap[est.matricula]))
-            }
-        } else {
-            val evalActual = evaluaciones.find { getEvalDisplayName(it) == seleccion }
-            val notasActuales = todasLasNotas[evalActual?.id] ?: emptyMap<String, Double>()
-            
-            alumnosFiltrados.forEach { est ->
-                val nota = notasActuales[est.matricula] ?: -1.0
-                val gradable = GradableEstudiante(est.matricula, est.nombre, nota, false, observacionesMap[est.matricula])
-                listaMostrable.add(gradable)
-            }
-        }
-        
-        adapter.updateData(listaMostrable.sortedBy { it.nombre })
-        
+        val listSize = viewModel.estudiantes.value?.size ?: 0
         searchJob?.cancel()
-        if (currentQuery.isNotEmpty() && listaMostrable.isEmpty()) {
+        if (currentQuery.isNotEmpty() && listSize == 0) {
             searchJob = CoroutineScope(Dispatchers.Main).launch {
                 delay(300)
                 searchListener?.onEmptySearch(currentQuery)
@@ -1376,7 +1388,6 @@ class StudentListFragment : Fragment() {
     private fun resaltarYDesplazarHacia(matricula: String) {
         val posicion = adapter.estudiantes.indexOfFirst { it.matricula == matricula }
         if (posicion != -1) {
-            recyclerView.smoothScrollToPosition(posicion)
             adapter.highlightedStudentId = matricula
             adapter.notifyItemChanged(posicion)
             
@@ -1384,7 +1395,10 @@ class StudentListFragment : Fragment() {
                 kotlinx.coroutines.delay(1500)
                 if (isAdded && adapter.highlightedStudentId == matricula) {
                     adapter.highlightedStudentId = null
-                    adapter.notifyItemChanged(posicion)
+                    val index = adapter.estudiantes.indexOfFirst { it.matricula == matricula }
+                    if (index != -1) {
+                        adapter.notifyItemChanged(index)
+                    }
                 }
             }
         }
@@ -1428,24 +1442,7 @@ class StudentListFragment : Fragment() {
     private fun actualizarNotaEnFirebase(eval: Evaluacion, matricula: String, nota: Double?) {
         val currentNrc = nrc ?: return
         val currentCodigo = codigoMateria ?: return
-        
-        val refTradicional = database.child("seccion_detalles").child(currentNrc)
-            .child("notas").child(eval.id).child(matricula)
-            
-        val refRecord = database.child("estudiante_records").child(matricula)
-            .child(currentCodigo).child(eval.id)
-
-        if (nota == null) {
-            refTradicional.removeValue()
-            refRecord.removeValue()
-        } else {
-            refTradicional.setValue(nota)
-            val recordMap = mapOf(
-                "nombre" to eval.nombre,
-                "nota" to nota
-            )
-            refRecord.setValue(recordMap)
-        }
+        repository.actualizarNotaConNombreEval(currentNrc, currentCodigo, eval.id, eval.nombre, matricula, nota)
     }
 
     private fun toggleFabMenu() {
@@ -1501,6 +1498,34 @@ class StudentListFragment : Fragment() {
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {}
+
+    fun tieneEvaluacionIndividualSeleccionada(): Boolean {
+        val seleccion = spinnerEvaluaciones.selectedItem?.toString() ?: return false
+        return seleccion != ACUMULADO_TEXT && evaluaciones.any { getEvalDisplayName(it) == seleccion && it.esExtra == 0 }
+    }
+
+    fun mostrarDialogoEditarNombreEvaluacion() {
+        val seleccion = spinnerEvaluaciones.selectedItem?.toString() ?: return
+        val evalActual = evaluaciones.find { getEvalDisplayName(it) == seleccion } ?: return
+
+        val etNombre = EditText(requireContext()).apply {
+            setText(evalActual.nombre)
+            setPadding(60, 40, 60, 40)
+        }
+
+        AlertDialog.Builder(requireContext())
+            .setTitle("Editar nombre de evaluación")
+            .setView(etNombre)
+            .setPositiveButton("Guardar") { _, _ ->
+                val nuevoNombre = etNombre.text.toString().trim()
+                if (nuevoNombre.isNotEmpty()) {
+                    repository.actualizarNombreEvaluacion(nrc!!, codigoMateria, evalActual.id, nuevoNombre)
+                    Toast.makeText(requireContext(), "Nombre actualizado", Toast.LENGTH_SHORT).show()
+                }
+            }
+            .setNegativeButton("Cancelar", null)
+            .show()
+    }
 
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)

@@ -6,6 +6,16 @@
     android:padding="12dp">
 
     <TextView
+        android:id="@+id/tvOrdenCaptura"
+        android:layout_width="28dp"
+        android:layout_height="wrap_content"
+        android:gravity="center"
+        android:textStyle="bold"
+        android:textColor="@color/uasd_blue"
+        android:textSize="12sp"
+        android:visibility="gone" />
+
+    <TextView
         android:id="@+id/tvMatricula"
         android:layout_width="100dp"
         android:layout_height="wrap_content"

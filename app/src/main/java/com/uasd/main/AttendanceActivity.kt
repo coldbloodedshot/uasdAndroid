@@ -99,11 +99,21 @@ class AttendanceActivity : AppCompatActivity() {
         }
     }
 
+    private val listeners = mutableListOf<Pair<DatabaseReference, ValueEventListener>>()
+
+    override fun onDestroy() {
+        super.onDestroy()
+        listeners.forEach { (ref, listener) ->
+            ref.removeEventListener(listener)
+        }
+        listeners.clear()
+    }
+
     private fun cargarDatos() {
         val ref = database.child("seccion_detalles").child(nrc!!)
         
         // 1. Alumnos
-        ref.child("estudiantes").addValueEventListener(object : ValueEventListener {
+        val alumnosListener = object : ValueEventListener {
             override fun onDataChange(snapshot: DataSnapshot) {
                 listaAlumnos.clear()
                 for (s in snapshot.children) {
@@ -112,10 +122,13 @@ class AttendanceActivity : AppCompatActivity() {
                 actualizarUI()
             }
             override fun onCancelled(error: DatabaseError) {}
-        })
+        }
+        val refEstudiantes = ref.child("estudiantes")
+        refEstudiantes.addValueEventListener(alumnosListener)
+        listeners.add(Pair(refEstudiantes, alumnosListener))
 
         // 2. Sesiones
-        ref.child("asistencias").addValueEventListener(object : ValueEventListener {
+        val sesionesListener = object : ValueEventListener {
             override fun onDataChange(snapshot: DataSnapshot) {
                 sesiones.clear()
                 val nombres = mutableListOf(RESUMEN_TEXT)
@@ -132,10 +145,13 @@ class AttendanceActivity : AppCompatActivity() {
                 actualizarUI()
             }
             override fun onCancelled(error: DatabaseError) {}
-        })
+        }
+        val refAsistencias = ref.child("asistencias")
+        refAsistencias.addValueEventListener(sesionesListener)
+        listeners.add(Pair(refAsistencias, sesionesListener))
 
         // 3. Todos los datos de asistencia (para resumen)
-        ref.child("asistencia_datos").addValueEventListener(object : ValueEventListener {
+        val datosAsistenciaListener = object : ValueEventListener {
             override fun onDataChange(snapshot: DataSnapshot) {
                 todasAsistenciasMap.clear()
                 for (sesionSnap in snapshot.children) {
@@ -149,7 +165,10 @@ class AttendanceActivity : AppCompatActivity() {
                 actualizarUI()
             }
             override fun onCancelled(error: DatabaseError) {}
-        })
+        }
+        val refAsistenciaDatos = ref.child("asistencia_datos")
+        refAsistenciaDatos.addValueEventListener(datosAsistenciaListener)
+        listeners.add(Pair(refAsistenciaDatos, datosAsistenciaListener))
     }
 
     private fun actualizarUI() {

@@ -61,6 +61,18 @@
             </FrameLayout>
 
             <ImageButton
+                android:id="@+id/btnToggleOrden"
+                android:layout_width="40dp"
+                android:layout_height="40dp"
+                android:layout_marginStart="4dp"
+                android:background="?attr/selectableItemBackgroundBorderless"
+                android:src="@android:drawable/ic_menu_sort_by_size"
+                android:padding="8dp"
+                android:scaleType="centerInside"
+                android:visibility="gone"
+                android:contentDescription="Ordenar por fecha de captura" />
+
+            <ImageButton
                 android:id="@+id/btnDictado"
                 android:layout_width="40dp"
                 android:layout_height="40dp"

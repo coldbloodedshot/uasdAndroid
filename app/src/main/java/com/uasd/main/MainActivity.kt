@@ -2,6 +2,7 @@ package com.uasd.main
 
 import android.os.Bundle
 import android.view.View
+import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
@@ -18,8 +19,19 @@ class MainActivity : AppCompatActivity() {
     private lateinit var adapter: SeccionAdapter
     private lateinit var recyclerView: RecyclerView
     private lateinit var tvEmpty: TextView
+    private lateinit var progressBar: ProgressBar
     private var seccionesListener: ValueEventListener? = null
     private var seccionesRef: DatabaseReference? = null
+
+    private val timeRefreshHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val timeRefreshRunnable = object : Runnable {
+        override fun run() {
+            if (::adapter.isInitialized) {
+                adapter.notifyDataSetChanged()
+            }
+            timeRefreshHandler.postDelayed(this, 60000) // Actualizar cada minuto
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -32,6 +44,7 @@ class MainActivity : AppCompatActivity() {
         // Setup UI
         recyclerView = findViewById(R.id.recyclerViewSections)
         tvEmpty = findViewById(R.id.textViewEmpty)
+        progressBar = findViewById(R.id.progressBarLoading)
         recyclerView.layoutManager = LinearLayoutManager(this)
         adapter = SeccionAdapter(emptyList()) { seccion ->
             val sameSubjectSections = adapter.getData().filter { it.nombreMateria == seccion.nombreMateria }
@@ -59,6 +72,7 @@ class MainActivity : AppCompatActivity() {
                 if (task.isSuccessful) {
                     escucharSecciones()
                 } else {
+                    progressBar.visibility = View.GONE
                     Toast.makeText(this, "Error de autenticación: ${task.exception?.message}", Toast.LENGTH_LONG).show()
                 }
             }
@@ -101,10 +115,21 @@ class MainActivity : AppCompatActivity() {
             }
 
             override fun onCancelled(error: DatabaseError) {
+                progressBar.visibility = View.GONE
                 Toast.makeText(this@MainActivity, "Error al cargar datos: ${error.message}", Toast.LENGTH_SHORT).show()
             }
         }
         seccionesRef?.addValueEventListener(seccionesListener!!)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        timeRefreshHandler.post(timeRefreshRunnable)
+    }
+
+    override fun onPause() {
+        super.onPause()
+        timeRefreshHandler.removeCallbacks(timeRefreshRunnable)
     }
 
     override fun onDestroy() {
@@ -113,6 +138,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun actualizarUI(listaSecciones: List<Seccion>) {
+        // Ocultar el indicador de carga al recibir los datos de Firebase
+        progressBar.visibility = View.GONE
         if (listaSecciones.isEmpty()) {
             tvEmpty.visibility = View.VISIBLE
             recyclerView.visibility = View.GONE

@@ -6,8 +6,10 @@ import android.view.ViewGroup
 import android.widget.TextView
 import androidx.recyclerview.widget.RecyclerView
 
-class EncuentroAdapter(private var encuentros: List<SeccionEncuentro>) :
-    RecyclerView.Adapter<EncuentroAdapter.ViewHolder>() {
+class EncuentroAdapter(
+    private var encuentros: List<SeccionEncuentro>,
+    private val onEncuentroClick: (SeccionEncuentro) -> Unit
+) : RecyclerView.Adapter<EncuentroAdapter.ViewHolder>() {
 
     class ViewHolder(view: View) : RecyclerView.ViewHolder(view) {
         val tvMateria: TextView = view.findViewById(R.id.tvMateriaCalendario)
@@ -34,6 +36,10 @@ class EncuentroAdapter(private var encuentros: List<SeccionEncuentro>) :
             androidx.core.content.ContextCompat.getColor(holder.itemView.context, R.color.light_gray)
         }
         holder.itemView.setBackgroundColor(color)
+
+        holder.itemView.setOnClickListener {
+            onEncuentroClick(item)
+        }
     }
 
     override fun getItemCount() = encuentros.size

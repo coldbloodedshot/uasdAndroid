@@ -12,6 +12,7 @@ import androidx.recyclerview.widget.RecyclerView
 class EstudianteAdapter(
     var estudiantes: List<GradableEstudiante>,
     var isDictationMode: Boolean = false,
+    var mostrarOrdenCaptura: Boolean = false,
     private val onGradeClick: (GradableEstudiante) -> Unit,
     private val onNoteClick: (GradableEstudiante) -> Unit,
     private val onDictationApproveClick: (GradableEstudiante, Double?) -> Unit
@@ -20,6 +21,7 @@ class EstudianteAdapter(
     var highlightedStudentId: String? = null
 
     class ViewHolder(view: View) : RecyclerView.ViewHolder(view) {
+        val tvOrdenCaptura: TextView = view.findViewById(R.id.tvOrdenCaptura)
         val tvMatricula: TextView = view.findViewById(R.id.tvMatricula)
         val tvNombre: TextView = view.findViewById(R.id.tvNombre)
         val tvNota: TextView = view.findViewById(R.id.tvNota)
@@ -49,6 +51,13 @@ class EstudianteAdapter(
         }
         holder.itemView.setBackgroundColor(color)
         
+        if (mostrarOrdenCaptura && item.ordenCaptura > 0) {
+            holder.tvOrdenCaptura.visibility = View.VISIBLE
+            holder.tvOrdenCaptura.text = item.ordenCaptura.toString()
+        } else {
+            holder.tvOrdenCaptura.visibility = View.GONE
+        }
+
         holder.tvMatricula.text = item.matricula
         holder.tvNombre.text = item.nombre
         
