@@ -271,6 +271,13 @@ class StudentListFragment : Fragment() {
             
             viewModel.estudiantes.observe(viewLifecycleOwner) { lista ->
                 adapter.updateData(lista)
+                
+                // Keep local lists synchronized for helper dialogs and voice recognizers
+                listaAlumnosOriginal.clear()
+                lista.forEach { 
+                    listaAlumnosOriginal.add(Estudiante(it.matricula, it.nombre))
+                }
+                
                 // If there's a pending highlighted student, scroll to them now that the list has been updated and reordered
                 adapter.highlightedStudentId?.let { matricula ->
                     val index = lista.indexOfFirst { it.matricula == matricula }
@@ -289,6 +296,88 @@ class StudentListFragment : Fragment() {
                     android.R.drawable.ic_menu_sort_by_size
                 }
                 btnToggleOrden.setImageResource(imageRes)
+            }
+
+            viewModel.evaluaciones.observe(viewLifecycleOwner) { evals ->
+                evaluaciones.clear()
+                evaluaciones.addAll(evals)
+
+                val nombresEval = mutableListOf(ACUMULADO_TEXT)
+                evals.forEach { nombresEval.add(getEvalDisplayName(it)) }
+                
+                val currentContext = context ?: return@observe
+                val spinnerAdapter = ArrayAdapter(currentContext, android.R.layout.simple_spinner_item, nombresEval)
+                spinnerAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+                spinnerEvaluaciones.adapter = spinnerAdapter
+
+                val seleccionActual = spinnerEvaluaciones.selectedItem?.toString()
+                
+                if (pendingSelectEvalId != null) {
+                    val targetEval = evaluaciones.find { it.id == pendingSelectEvalId }
+                    if (targetEval != null) {
+                        val displayName = getEvalDisplayName(targetEval)
+                        val pos = nombresEval.indexOf(displayName)
+                        if (pos != -1) {
+                            spinnerEvaluaciones.setSelection(pos)
+                            pendingSelectEvalId = null
+                        }
+                    }
+                } else if (prevEvalName != null) {
+                    val match = evaluaciones.find { it.nombre.trim().equals(prevEvalName?.trim(), ignoreCase = true) }
+                    if (match != null) {
+                        val displayName = getEvalDisplayName(match)
+                        val pos = nombresEval.indexOf(displayName)
+                        if (pos != -1) {
+                            spinnerEvaluaciones.setSelection(pos)
+                            
+                            if (wantDictation) {
+                                spinnerEvaluaciones.post {
+                                    if (isAdded && !isDictationMode) {
+                                        iniciarFlujoDictado()
+                                    }
+                                }
+                            }
+                        }
+                        prevEvalName = null
+                        wantDictation = false
+                    } else if (evaluaciones.isNotEmpty()) {
+                        prevEvalName = null
+                        wantDictation = false
+                    }
+                } else if (seleccionActual == null || seleccionActual == ACUMULADO_TEXT) {
+                    val targetEval = if (pendingSelectEvalId != null) {
+                        evaluaciones.find { it.id == pendingSelectEvalId }
+                    } else {
+                        evaluaciones.find { it.esExtra == 1 }
+                    }
+                    
+                    if (targetEval != null) {
+                        val displayName = getEvalDisplayName(targetEval)
+                        val pos = nombresEval.indexOf(displayName)
+                        if (pos != -1) {
+                            spinnerEvaluaciones.setSelection(pos)
+                            pendingSelectEvalId = null
+                        }
+                    }
+                }
+            }
+            // Bind ViewModel's internal structures to local maps so helper dialogs have local data access
+            viewModel.estudiantes.observe(viewLifecycleOwner) {
+                // Keep todasLasNotas and observacionesMap synchronized for helper detail dialogs
+                todasLasNotas.clear()
+                observacionesMap.clear()
+                viewModel.evaluaciones.value?.forEach { eval ->
+                    val map = mutableMapOf<String, Double>()
+                    it.forEach { gradable ->
+                        if (gradable.nota > -1) {
+                            map[gradable.matricula] = gradable.nota
+                        }
+                        gradable.observacion?.let { obs ->
+                            observacionesMap[gradable.matricula] = obs
+                        }
+                    }
+                    todasLasNotas[eval.id] = map
+                }
             }
 
             // Data loading is triggered automatically by ViewModel's init block.
