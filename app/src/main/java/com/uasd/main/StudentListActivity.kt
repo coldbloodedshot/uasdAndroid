@@ -203,9 +203,14 @@ class StudentListActivity : AppCompatActivity(), StudentListFragment.OnSearchLis
     }
 
     override fun onPrepareOptionsMenu(menu: Menu?): Boolean {
-        val mostrarOpcionesEval = getCurrentFragment()?.tieneEvaluacionIndividualSeleccionada() == true
+        val fragment = getCurrentFragment()
+        val mostrarOpcionesEval = fragment?.tieneEvaluacionIndividualSeleccionada() == true
         menu?.findItem(R.id.action_edit_eval_name)?.isVisible = mostrarOpcionesEval
         menu?.findItem(R.id.action_delete_eval)?.isVisible = mostrarOpcionesEval
+        menu?.findItem(R.id.action_blank_eval)?.isVisible = mostrarOpcionesEval
+        // Sync the checkable state of Gemini correction toggle
+        val geminiEnabled = fragment?.isGeminiCorrectionEnabled() ?: true
+        menu?.findItem(R.id.action_gemini_correction)?.isChecked = geminiEnabled
         return super.onPrepareOptionsMenu(menu)
     }
 
@@ -225,12 +230,22 @@ class StudentListActivity : AppCompatActivity(), StudentListFragment.OnSearchLis
                 fragment.mostrarDialogoEliminarEvaluacion()
                 true
             }
+            R.id.action_blank_eval -> {
+                fragment.mostrarDialogoPonerEnBlanco()
+                true
+            }
             R.id.action_stats -> {
                 fragment.mostrarEstadisticas()
                 true
             }
             R.id.action_dictation_settings -> {
                 fragment.mostrarConfiguracionDictado()
+                true
+            }
+            R.id.action_gemini_correction -> {
+                fragment.toggleGeminiCorrection()
+                // Refresh menu so the checkmark updates immediately
+                invalidateOptionsMenu()
                 true
             }
             else -> super.onOptionsItemSelected(item)

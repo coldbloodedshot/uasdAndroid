@@ -4,7 +4,6 @@ plugins {
     id 'com.google.gms.google-services'
 }
 
-// Cargar archivo local.properties
 def localProperties = new Properties()
 def localPropertiesFile = rootProject.file('local.properties')
 if (localPropertiesFile.exists()) {
@@ -26,7 +25,6 @@ android {
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
 
-        // Inyectar API Key de Gemini
         def geminiApiKey = localProperties.getProperty('gemini.api.key', '')
         buildConfigField "String", "GEMINI_API_KEY", "\"${geminiApiKey}\""
     }
@@ -49,6 +47,7 @@ android {
         jvmTarget = '1.8'
     }
 
+
     packagingOptions {
         exclude 'META-INF/DEPENDENCIES'
         exclude 'META-INF/LICENSE'
@@ -59,21 +58,21 @@ android {
         exclude 'META-INF/notice.txt'
         exclude 'META-INF/ASL2.0'
         exclude("META-INF/*.kotlin_module")
+        pickFirst '**/libc++_shared.so'
     }
 }
 
 dependencies {
+    // sin cambios
     implementation 'androidx.core:core-ktx:1.10.1'
     implementation 'androidx.appcompat:appcompat:1.6.1'
     implementation 'com.google.android.material:material:1.9.0'
     implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
 
-    // Firebase
     implementation platform('com.google.firebase:firebase-bom:32.2.0')
     implementation 'com.google.firebase:firebase-database-ktx'
     implementation 'com.google.firebase:firebase-auth-ktx'
-    
-    // Google Drive & Auth
+
     implementation 'com.google.android.gms:play-services-auth:20.7.0'
     implementation('com.google.api-client:google-api-client-android:1.26.0') {
         exclude group: 'org.apache.httpcomponents'
@@ -83,18 +82,13 @@ dependencies {
     }
     implementation 'com.google.auth:google-auth-library-oauth2-http:1.19.0'
 
-    // Lifecycle (for lifecycleScope)
     implementation 'androidx.lifecycle:lifecycle-runtime-ktx:2.6.1'
-
-    // Coroutines
     implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.6.4'
     implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.6.4'
 
-    // Vosk Voice Recognition
     implementation 'com.alphacephei:vosk-android:0.3.32'
     implementation 'net.java.dev.jna:jna:5.13.0@aar'
 
-    // Gemini AI
     implementation 'com.google.ai.client.generativeai:generativeai:0.7.0'
 
     testImplementation 'junit:junit:4.13.2'

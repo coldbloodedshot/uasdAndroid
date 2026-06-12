@@ -1,24 +1,29 @@
 package com.uasd.main
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.content.Intent
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaRecorder
 import android.os.Bundle
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
-import android.util.Log
 import com.google.ai.client.generativeai.GenerativeModel
 import com.google.ai.client.generativeai.type.content
 import kotlinx.coroutines.*
 import org.json.JSONObject
 import org.vosk.Model
 import org.vosk.Recognizer
-import org.vosk.android.SpeechService
 import org.vosk.android.StorageService
 import java.io.File
 import java.io.FileInputStream
+import java.io.FileOutputStream
 import java.io.IOException
-import org.vosk.android.RecognitionListener as VoskRecognitionListener
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import android.util.Log
 
 class DictationManager(
     private val context: Context,
@@ -40,6 +45,7 @@ class DictationManager(
 
     private val PREFS_NAME = "uasd_prefs"
     private val KEY_DICTATION_MODE = "dictation_mode"
+    private val KEY_USE_GEMINI_CORRECTION = "use_gemini_correction"
     private val MODE_VOSK = "vosk"
     private val MODE_NATIVE = "native"
     private val MODE_GEMINI = "gemini"
@@ -53,21 +59,48 @@ class DictationManager(
 
     // Vosk
     private var voskModel: Model? = null
-    private var voskSpeechService: SpeechService? = null
+    private var voskRecognizer: Recognizer? = null
+    private var voskAudioRecord: AudioRecord? = null
+    private var voskAudioJob: Job? = null
     private var isVoskLoading = false
     private var voskListeningActive = false
     private var voskFinalBuffer = StringBuilder()
 
+    // Gemini fallback cooldown
+    private var geminiFallbackInProgress = false
+    private var lastGeminiFallbackTime = 0L
+    private val GEMINI_FALLBACK_COOLDOWN_MS = 3000L
+
     // Native
     private var nativeSpeechRecognizer: SpeechRecognizer? = null
+
+    // Native — circular audio buffer (4 seconds @ 16 kHz, 16-bit mono = 128 000 bytes)
+    private val SAMPLE_RATE = 16000
+    private val BUFFER_SECONDS = 4
+    private val BUFFER_SIZE = SAMPLE_RATE * 2 * BUFFER_SECONDS // 128 000 bytes
+    private val audioCircularBuffer = ByteArray(BUFFER_SIZE)
+    private var circularBufferIndex = 0          // write-head (wraps around)
+    private var circularBufferFilled = false      // true once the buffer has been written at least once fully
+    private var currentEstudiantesList: List<Estudiante> = emptyList()
 
     // Gemini
     private var audioRecorder: AudioRecorder? = null
     private var generativeModel: GenerativeModel? = null
     private var geminiStartTime: Long = 0
 
+
     fun getDictationMode(): String {
         return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).getString(KEY_DICTATION_MODE, MODE_VOSK) ?: MODE_VOSK
+    }
+
+    fun isGeminiCorrectionEnabled(): Boolean {
+        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getBoolean(KEY_USE_GEMINI_CORRECTION, true)
+    }
+
+    fun setGeminiCorrectionEnabled(enabled: Boolean) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit().putBoolean(KEY_USE_GEMINI_CORRECTION, enabled).apply()
     }
 
     fun initVoskModel() {
@@ -82,6 +115,9 @@ class DictationManager(
                 isVoskLoading = false
                 Log.d("DictationManager", "Modelo Vosk cargado exitosamente")
                 callback.onVoskModelLoaded()
+                if (isDictationMode) {
+                    startVoskDictation(currentEstudiantesList)
+                }
             },
             { exception: Exception ->
                 if (released) return@unpack
@@ -94,7 +130,9 @@ class DictationManager(
     fun startDictation(estudiantesList: List<Estudiante>) {
         if (released) return
         val mode = getDictationMode()
+        Log.d("DictationManager", "Iniciando dictado con modo: $mode")
         isDictationMode = true
+        currentEstudiantesList = estudiantesList
         
         when (mode) {
             MODE_VOSK -> startVoskDictation(estudiantesList)
@@ -119,13 +157,11 @@ class DictationManager(
     }
 
     // --- VOSK ---
+    @SuppressLint("MissingPermission")
     private fun startVoskDictation(estudiantesList: List<Estudiante>) {
         if (released) return
         if (voskModel == null) {
-            isDictationMode = false
-            if (isVoskLoading) {
-                callback.onError("El modelo aún se está cargando...")
-            } else {
+            if (!isVoskLoading) {
                 initVoskModel()
             }
             return
@@ -133,6 +169,7 @@ class DictationManager(
 
         callback.onStatusChanged("DICTADO VOSK (Escuchando...)", android.graphics.Color.RED)
         voskFinalBuffer.setLength(0)
+        resetAudioBuffer()
 
         try {
             val nombres = estudiantesList.flatMap { 
@@ -149,70 +186,100 @@ class DictationManager(
                 "cuarenta", "cincuenta", "sesenta", "setenta", "ochenta", "noventa", "cien", "punto", "coma"
             )
             
-            val grammarList = (nombres + nombresCompletos + matriculas + numerosDigitos + numerosPalabras + listOf("[unk]")).distinct()
+            val grammarList = (nombres + nombresCompletos + matriculas + numerosDigitos + numerosPalabras+ listOf("[unk]")).distinct()
             val grammarJson = org.json.JSONArray(grammarList).toString()
-            
-            val rec = Recognizer(voskModel, 16000.0f, grammarJson)
-            voskSpeechService = SpeechService(rec, 16000.0f)
-            voskSpeechService?.startListening(object : VoskRecognitionListener {
-                override fun onPartialResult(hypothesis: String) {
-                    val text = JSONObject(hypothesis).optString("partial")
-                    if (text.isNotEmpty()) {
-                        val currentTotal = if (voskFinalBuffer.isEmpty()) text else "${voskFinalBuffer} $text"
-                        procesarTextoDictado(currentTotal, false, estudiantesList)
-                    }
-                }
 
-                override fun onResult(hypothesis: String) {
-                    val text = JSONObject(hypothesis).optString("text")
-                    if (text.isNotEmpty()) {
-                        if (voskFinalBuffer.isNotEmpty()) voskFinalBuffer.append(" ")
-                        voskFinalBuffer.append(text)
-                        procesarTextoDictado(voskFinalBuffer.toString(), true, estudiantesList)
-                    }
-                }
+            val minBufferSize = AudioRecord.getMinBufferSize(
+                SAMPLE_RATE,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT
+            )
+            if (minBufferSize <= 0) {
+                callback.onError("No se pudo inicializar el micrófono para Vosk.")
+                stopDictation()
+                return
+            }
 
-                override fun onFinalResult(hypothesis: String) {
-                    val text = JSONObject(hypothesis).optString("text")
-                    if (text.isNotEmpty()) {
-                        if (voskFinalBuffer.isNotEmpty()) voskFinalBuffer.append(" ")
-                        voskFinalBuffer.append(text)
-                        procesarTextoDictado(voskFinalBuffer.toString(), true, estudiantesList)
-                    }
-                }
-
-                override fun onError(exception: java.lang.Exception) {
-                    callback.onError(exception.message ?: "Error desconocido en Vosk")
-                }
-                override fun onTimeout() {}
-            })
+            val readBufferSize = maxOf(minBufferSize, 4096)
+            voskRecognizer = Recognizer(voskModel, SAMPLE_RATE.toFloat(), grammarJson)
+            voskAudioRecord = AudioRecord(
+                MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                SAMPLE_RATE,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT,
+                readBufferSize
+            )
+            voskAudioRecord?.startRecording()
             voskListeningActive = true
+
+            voskAudioJob = managerScope.launch(Dispatchers.IO) {
+                val buffer = ByteArray(readBufferSize)
+                var lastPartialText = ""
+                while (isDictationMode && voskListeningActive && voskAudioRecord?.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                    val read = voskAudioRecord?.read(buffer, 0, buffer.size) ?: 0
+                    if (read <= 0) continue
+
+                    writeToCircularBuffer(buffer, read)
+                    val recognizer = voskRecognizer ?: break
+                    val hasFinalResult = recognizer.acceptWaveForm(buffer, read)
+
+                    if (hasFinalResult) {
+                        val text = JSONObject(recognizer.result).optString("text")
+                        Log.d("DictationManager", "Vosk reconoció: \"$text\"")
+                        if (text.isNotEmpty()) {
+                            lastPartialText = ""
+                            if (voskFinalBuffer.isNotEmpty()) voskFinalBuffer.append(" ")
+                            voskFinalBuffer.append(text)
+                            val recognized = withContext(Dispatchers.Main) {
+                                procesarTextoDictado(voskFinalBuffer.toString(), true, estudiantesList)
+                            }
+                            if (!recognized) {
+                                triggerGeminiFallback()
+                            }
+                        }
+                    } else {
+                        val partial = JSONObject(recognizer.partialResult).optString("partial")
+                        if (partial.isNotEmpty() && partial != lastPartialText) {
+                            lastPartialText = partial
+                            val currentTotal = if (voskFinalBuffer.isEmpty()) partial else "${voskFinalBuffer} $partial"
+                            withContext(Dispatchers.Main) {
+                                procesarTextoDictado(currentTotal, false, estudiantesList)
+                            }
+                        }
+                    }
+                }
+            }
         } catch (e: Exception) {
+            Log.e("DictationManager", "Error iniciando Vosk con AudioRecord: ${e.message}", e)
             voskListeningActive = false
             stopDictation()
         }
     }
 
     private fun stopVoskDictation() {
-        if (!voskListeningActive) {
-            voskSpeechService = null
-            return
-        }
         voskListeningActive = false
+        voskAudioJob?.cancel()
+        voskAudioJob = null
         try {
-            voskSpeechService?.stop()
-        } catch (e: IllegalArgumentException) {
-            Log.w("DictationManager", "Vosk: receiver ya liberado")
+            if (voskAudioRecord?.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                voskAudioRecord?.stop()
+            }
+        } catch (_: IllegalArgumentException) {
+            Log.w("DictationManager", "Vosk: AudioRecord ya detenido")
         } catch (e: Exception) {
             Log.e("DictationManager", "Error deteniendo Vosk: ${e.message}")
         }
-        voskSpeechService = null
+        voskAudioRecord?.release()
+        voskAudioRecord = null
+        voskRecognizer?.close()
+        voskRecognizer = null
+        resetAudioBuffer()
     }
 
     // --- NATIVE SPEECH RECOGNIZER ---
     private fun startNativeDictation(estudiantesList: List<Estudiante>) {
         if (nativeSpeechRecognizer != null) return
-        
+
         callback.onStatusChanged("DICTADO NATIVO (Escuchando...)", android.graphics.Color.RED)
         nativeSpeechRecognizer = SpeechRecognizer.createSpeechRecognizer(context)
 
@@ -230,7 +297,11 @@ class DictationManager(
             override fun onBufferReceived(buffer: ByteArray?) {}
             override fun onEndOfSpeech() {}
             override fun onError(error: Int) {
-                if (isDictationMode && (error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT || error == SpeechRecognizer.ERROR_NO_MATCH || error == 7)) {
+                val isNoMatch = error == SpeechRecognizer.ERROR_NO_MATCH
+                val isTimeout = error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT
+                Log.w("DictationManager", "SpeechRecognizer.onError: code=$error isNoMatch=$isNoMatch isTimeout=$isTimeout")
+
+                if (isDictationMode && (isNoMatch || isTimeout)) {
                     val handler = android.os.Handler(android.os.Looper.getMainLooper())
                     handler.postDelayed({
                         if (isDictationMode) nativeSpeechRecognizer?.startListening(intent)
@@ -242,7 +313,9 @@ class DictationManager(
             override fun onResults(results: Bundle?) {
                 val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                 if (!matches.isNullOrEmpty()) {
-                    procesarTextoDictado(matches[0], true, estudiantesList)
+                    val textoReconocido = matches[0]
+                    Log.d("DictationManager", "onResults: \"$textoReconocido\"")
+                    procesarTextoDictado(textoReconocido, true, estudiantesList)
                 }
                 if (isDictationMode) {
                     nativeSpeechRecognizer?.startListening(intent)
@@ -266,6 +339,148 @@ class DictationManager(
         nativeSpeechRecognizer = null
     }
 
+    // --- CIRCULAR AUDIO BUFFER ---
+
+    @Synchronized
+    private fun resetAudioBuffer() {
+        circularBufferIndex = 0
+        circularBufferFilled = false
+    }
+
+    /** Writes [length] bytes from [data] into the circular buffer. Thread‑safe via @Synchronized. */
+    @Synchronized
+    private fun writeToCircularBuffer(data: ByteArray, length: Int) {
+        val remaining = BUFFER_SIZE - circularBufferIndex
+        if (length <= remaining) {
+            System.arraycopy(data, 0, audioCircularBuffer, circularBufferIndex, length)
+            circularBufferIndex += length
+            if (circularBufferIndex >= BUFFER_SIZE) {
+                circularBufferIndex = 0
+                circularBufferFilled = true
+            }
+        } else {
+            System.arraycopy(data, 0, audioCircularBuffer, circularBufferIndex, remaining)
+            val leftover = length - remaining
+            System.arraycopy(data, remaining, audioCircularBuffer, 0, leftover)
+            circularBufferIndex = leftover
+            circularBufferFilled = true
+        }
+    }
+
+    /**
+     * Returns the contents of the circular buffer in chronological order.
+     * If the buffer hasn't been filled yet, returns only what has been written.
+     */
+    @Synchronized
+    private fun getChronologicalAudio(): ByteArray {
+        return if (!circularBufferFilled) {
+            // Buffer not yet full — return whatever was written
+            audioCircularBuffer.copyOf(circularBufferIndex)
+        } else {
+            // Oldest data starts right after the write-head
+            val result = ByteArray(BUFFER_SIZE)
+            val tailLen = BUFFER_SIZE - circularBufferIndex
+            System.arraycopy(audioCircularBuffer, circularBufferIndex, result, 0, tailLen)
+            System.arraycopy(audioCircularBuffer, 0, result, tailLen, circularBufferIndex)
+            result
+        }
+    }
+
+    /**
+     * Writes raw PCM data to a temporary WAV file with a valid 44-byte RIFF header.
+     * Returns the [File] or null if writing fails.
+     */
+    private fun saveBufferToWavFile(pcmData: ByteArray): File? {
+        if (pcmData.isEmpty()) return null
+        return try {
+            val wavFile = File(context.cacheDir, "fallback_audio_${System.currentTimeMillis()}.wav")
+            FileOutputStream(wavFile).use { fos ->
+                val numChannels: Short = 1
+                val sampleRateHz = SAMPLE_RATE
+                val bitsPerSample: Short = 16
+                val byteRate = sampleRateHz * numChannels * (bitsPerSample / 8)
+                val blockAlign = (numChannels * (bitsPerSample / 8)).toShort()
+                val dataLen = pcmData.size
+                val chunkSize = 36 + dataLen
+
+                val header = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN).apply {
+                    // RIFF chunk
+                    put("RIFF".toByteArray())
+                    putInt(chunkSize)
+                    put("WAVE".toByteArray())
+                    // fmt  sub-chunk
+                    put("fmt ".toByteArray())
+                    putInt(16)                    // sub-chunk size (PCM)
+                    putShort(1)                   // AudioFormat = PCM
+                    putShort(numChannels)
+                    putInt(sampleRateHz)
+                    putInt(byteRate)
+                    putShort(blockAlign)
+                    putShort(bitsPerSample)
+                    // data sub-chunk
+                    put("data".toByteArray())
+                    putInt(dataLen)
+                }
+                fos.write(header.array())
+                fos.write(pcmData)
+            }
+            Log.d("DictationManager", "WAV guardado: ${wavFile.absolutePath} (${pcmData.size} bytes PCM)")
+            wavFile
+        } catch (e: IOException) {
+            Log.e("DictationManager", "Error guardando WAV: ${e.message}")
+            null
+        }
+    }
+
+    /**
+     * Triggered when Vosk produces text that the local matcher cannot assign.
+     * Saves the circular buffer as a WAV file and sends it to Gemini for fallback recognition.
+     */
+    private fun triggerGeminiFallback() {
+        if (!isGeminiCorrectionEnabled()) {
+            Log.d("DictationManager", "Corrección Gemini desactivada — omitiendo fallback")
+            return
+        }
+        val now = System.currentTimeMillis()
+        if (geminiFallbackInProgress) {
+            Log.d("DictationManager", "Fallback Gemini ya en progreso — omitiendo")
+            return
+        }
+        if (now - lastGeminiFallbackTime < GEMINI_FALLBACK_COOLDOWN_MS) {
+            Log.d("DictationManager", "Fallback Gemini en cooldown (${now - lastGeminiFallbackTime}ms) — omitiendo")
+            return
+        }
+        geminiFallbackInProgress = true
+        lastGeminiFallbackTime = now
+        managerScope.launch(Dispatchers.IO) {
+            try {
+                val pcmData = getChronologicalAudio()
+                if (pcmData.isEmpty()) {
+                    Log.d("DictationManager", "Buffer vacío — omitiendo fallback Gemini")
+                    return@launch
+                }
+                val wavFile = saveBufferToWavFile(pcmData)
+                if (wavFile == null) {
+                    Log.w("DictationManager", "No se pudo guardar WAV — omitiendo fallback Gemini")
+                    return@launch
+                }
+                val alumnos = currentEstudiantesList
+                if (alumnos.isEmpty()) {
+                    Log.d("DictationManager", "Lista de alumnos vacía — omitiendo fallback Gemini")
+                    return@launch
+                }
+                val alumnosPrompt = alumnos.joinToString("\n") { "ID: ${it.matricula} | Nombre: ${it.nombre}" }
+                Log.i("DictationManager", "🤖 Fallback Gemini activado — enviando ${wavFile.name} (${pcmData.size} bytes PCM)")
+                withContext(Dispatchers.Main) {
+                    callback.onStatusChanged("🤖 Consultando Gemini...", android.graphics.Color.rgb(255, 140, 0))
+                    procesarAudioConGeminiConAlumnos(wavFile, alumnosPrompt)
+                }
+            } finally {
+                geminiFallbackInProgress = false
+            }
+        }
+    }
+
     // --- GEMINI (HOLD-TO-TALK) ---
     private fun startGeminiDictation() {
         if (audioRecorder == null) audioRecorder = AudioRecorder(context)
@@ -286,21 +501,14 @@ class DictationManager(
     }
 
     private fun procesarAudioConGemini(audioFile: File) {
-        val geminiApiKey = BuildConfig.GEMINI_API_KEY
-        if (geminiApiKey.isEmpty()) {
-            callback.onError("API Key de Gemini no encontrada. Por favor agrégala en local.properties.")
+        val alumnos = currentEstudiantesList
+        if (alumnos.isEmpty()) {
+            callback.onError("Lista de alumnos vacía para Gemini.")
             return
         }
 
-        if (generativeModel == null) {
-            generativeModel = GenerativeModel(
-                modelName = "gemini-flash-latest",
-                apiKey = geminiApiKey
-            )
-        }
-
-        // Método legacy
-        Log.d("DictationManager", "Procesando audio localmente: ${audioFile.absolutePath}")
+        val alumnosPrompt = alumnos.joinToString("\n") { "ID: ${it.matricula} | Nombre: ${it.nombre}" }
+        procesarAudioConGeminiConAlumnos(audioFile, alumnosPrompt)
     }
 
     fun procesarAudioConGeminiConAlumnos(audioFile: File, alumnosContextPrompt: String) {
@@ -334,30 +542,96 @@ class DictationManager(
         managerScope.launch(Dispatchers.IO) {
             try {
                 val inputAudio = FileInputStream(audioFile).use { it.readBytes() }
+                if (inputAudio.isEmpty()) {
+                    withContext(Dispatchers.Main) {
+                        callback.onError("El archivo de audio está vacío.")
+                    }
+                    return@launch
+                }
+
+                // Determine MIME type from file extension (wav vs mpeg)
+                val mimeType = when {
+                    audioFile.name.endsWith(".wav", ignoreCase = true) -> "audio/wav"
+                    audioFile.name.endsWith(".mp3", ignoreCase = true) -> "audio/mpeg"
+                    else -> "audio/wav"
+                }
+
                 val content = content {
                     text(systemPrompt)
-                    blob("audio/mpeg", inputAudio)
+                    blob(mimeType, inputAudio)
                     text("Procesa este audio y devuelve las actualizaciones de notas.")
                 }
 
                 val response = generativeModel?.generateContent(content)
-                val responseText = response?.text ?: ""
-                
+                val responseText = response?.text
+
+                Log.d("DictationManager", "Respuesta cruda de Gemini: $responseText")
+
+                if (responseText.isNullOrBlank()) {
+                    withContext(Dispatchers.Main) {
+                        callback.onError("Gemini no devolvió ningún texto. Intenta de nuevo.")
+                    }
+                    return@launch
+                }
+
                 val jsonMatch = Regex("\\{.*\\}", RegexOption.DOT_MATCHES_ALL).find(responseText)
                 val jsonString = jsonMatch?.value ?: responseText
                 
+                Log.d("DictationManager", "String JSON extraído: $jsonString")
+
                 withContext(Dispatchers.Main) {
                     aplicarActualizacionesGemini(jsonString)
                 }
-            } catch (e: Exception) {
+            } catch (e: com.google.ai.client.generativeai.type.InvalidStateException) {
+                Log.e("DictationManager", "Gemini estado inválido: ${e.message}")
                 withContext(Dispatchers.Main) {
-                    callback.onError("Error Gemini: ${e.message}")
+                    callback.onError("Gemini: estado inválido. Verifica la API Key.")
+                }
+                        } catch (e: com.google.ai.client.generativeai.type.ServerException) {
+                Log.e("DictationManager", "Gemini server error: ${e.message}")
+                if (e.message?.contains("PERMISSION_DENIED") == true || e.message?.contains("\"code\": 403") == true) {
+                    withContext(Dispatchers.Main) {
+                        callback.onError("Gemini API key appears to be compromised or revoked (error 403). Please generate a new API key and update BuildConfig.GEMINI_API_KEY.")
+                    }
+                } else {
+                    withContext(Dispatchers.Main) {
+                        callback.onError("Gemini server error: ${e.message?.take(100)}")
+                    }
+                }
+            } catch (e: com.google.ai.client.generativeai.type.GoogleGenerativeAIException) {
+                Log.e("DictationManager", "Gemini error de servidor: ${e.message}")
+                withContext(Dispatchers.Main) {
+                    callback.onError("Gemini: error del servidor (${e.message?.take(80)}).")
+                }
+
+            } catch (e: IOException) {
+                Log.e("DictationManager", "Error de I/O leyendo audio: ${e.message}")
+                withContext(Dispatchers.Main) {
+                    callback.onError("Error leyendo el archivo de audio.")
+                }
+            } catch (e: Exception) {
+                Log.e("DictationManager", "Error inesperado en Gemini: ${e.message}", e)
+                withContext(Dispatchers.Main) {
+                    callback.onError("Error inesperado: ${e.message?.take(100)}.")
+                }
+            } finally {
+                // Clean up temporary WAV fallback files to avoid filling the cache directory
+                if (audioFile.name.startsWith("fallback_audio_") && audioFile.exists()) {
+                    audioFile.delete()
+                }
+                // Restore the "listening" status in the UI once Gemini is done (success or error)
+                if (isDictationMode) {
+                    withContext(Dispatchers.Main) {
+                        val status = if (modeIsVosk()) "DICTADO VOSK (Escuchando...)" else "DICTADO NATIVO (Escuchando...)"
+                        callback.onStatusChanged(status, android.graphics.Color.RED)
+                    }
                 }
             }
         }
     }
 
     private fun aplicarActualizacionesGemini(jsonString: String) {
+        Log.d("DictationManager", "Intentando parsear JSON de Gemini: $jsonString")
         try {
             val obj = JSONObject(jsonString)
             if (obj.has("errors")) {
@@ -375,15 +649,18 @@ class DictationManager(
                 val grade = update.getDouble("grade")
                 listUpdates.add(GradeUpdate(studentId, grade))
             }
+            if (listUpdates.isNotEmpty()) callback.onSoundSuccess()
             callback.onBulkGradesRecognized(listUpdates)
         } catch (e: Exception) {
+            Log.e("DictationManager", "Error parseando JSON: ${e.message}", e)
             callback.onError("Error interpretando respuesta de Gemini")
         }
     }
 
     // --- PROCESAMIENTO TEXTO / EXPRESIONES REGULARES ---
-    private fun procesarTextoDictado(texto: String, esFinal: Boolean, estudiantesList: List<Estudiante>) {
-        if (texto.isEmpty()) return
+    // Returns true if at least one student grade was successfully matched, false otherwise.
+    private fun procesarTextoDictado(texto: String, esFinal: Boolean, estudiantesList: List<Estudiante>): Boolean {
+        if (texto.isEmpty()) return false
         
         val wordToNum = mapOf(
             "cero" to 0, "uno" to 1, "dos" to 2, "tres" to 3, "cuatro" to 4, "cinco" to 5,
@@ -401,6 +678,7 @@ class DictationManager(
         val matches = blockRegex.findAll(texto).toList()
         
         var lastMatchEnd = -1
+        var alumnoReconocido = false
         
         for (m in matches) {
             val query = m.groupValues[1].trim()
@@ -445,6 +723,7 @@ class DictationManager(
                 val studentObj = estudiantesList.find { it.matricula == bestStudentId }
                 if (studentObj != null) {
                     callback.onGradeRecognized(studentObj.matricula, studentObj.nombre, grade)
+                    alumnoReconocido = true
                 }
                 lastMatchEnd = m.range.last
             } else {
@@ -460,6 +739,7 @@ class DictationManager(
             voskFinalBuffer.setLength(0)
             voskFinalBuffer.append(rest.trim())
         }
+        return alumnoReconocido
     }
 
     private fun modeIsVosk(): Boolean {

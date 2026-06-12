@@ -11,6 +11,11 @@
         android:title="Eliminar Evaluación"
         android:icon="@android:drawable/ic_menu_delete"
         app:showAsAction="never" />
+    <item
+        android:id="@+id/action_blank_eval"
+        android:title="Poner en blanco"
+        android:icon="@android:drawable/ic_menu_close_clear_cancel"
+        app:showAsAction="never" />
     
 
 
@@ -24,5 +29,11 @@
         android:id="@+id/action_dictation_settings"
         android:title="Ajustes de Dictado"
         android:icon="@android:drawable/ic_menu_preferences"
+        app:showAsAction="never" />
+
+    <item
+        android:id="@+id/action_gemini_correction"
+        android:title="Corrección con Gemini"
+        android:checkable="true"
         app:showAsAction="never" />
 </menu>

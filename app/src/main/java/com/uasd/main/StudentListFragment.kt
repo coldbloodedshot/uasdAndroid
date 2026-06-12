@@ -99,17 +99,11 @@ class StudentListFragment : Fragment() {
     private var currentQuery: String = ""
     private var pendingSelectEvalId: String? = null
     
-    private var voskModel: Model? = null
-    private var voskSpeechService: SpeechService? = null
-    private var nativeSpeechRecognizer: SpeechRecognizer? = null
-    private var audioRecorder: AudioRecorder? = null
-    private var generativeModel: GenerativeModel? = null
-    var isDictationMode = false
-        private set
-    private var isVoskLoading = false
-    private var currentDictationMatchId: String? = null
-    private var currentDictationSuggestedGrade: Double? = null
-    private var geminiStartTime: Long = 0
+    private lateinit var dictationManager: DictationManager
+    
+    val isDictationMode: Boolean
+        get() = if (this::dictationManager.isInitialized) dictationManager.isDictationMode else false
+        
     private var searchJob: Job? = null
     
     private val PREFS_NAME = "uasd_prefs"
@@ -182,23 +176,99 @@ class StudentListFragment : Fragment() {
             etSearch.text.clear()
         }
 
+        dictationManager = DictationManager(requireContext(), object : DictationManager.DictationCallback {
+            override fun onGradeRecognized(matricula: String, nombre: String, grade: Double) {
+                val sessionKey = "${matricula}_${grade}"
+                if (!savedMatchesThisSession.contains(sessionKey)) {
+                    val gradable = GradableEstudiante(matricula, nombre)
+                    guardarNotaDictado(gradable, grade)
+                    resaltarYDesplazarHacia(matricula)
+                    savedMatchesThisSession.add(sessionKey)
+                }
+            }
+            override fun onBulkGradesRecognized(updates: List<DictationManager.GradeUpdate>) {
+                var count = 0
+                for (update in updates) {
+                    val est = listaAlumnosOriginal.find { it.matricula == update.id }
+                    if (est != null) {
+                        val gradable = GradableEstudiante(est.matricula, est.nombre)
+                        guardarNotaDictado(gradable, update.grade)
+                        count++
+                    }
+                }
+                if (count > 0 && isAdded) {
+                    Toast.makeText(requireContext(), "Gemini actualizó $count notas", Toast.LENGTH_SHORT).show()
+                }
+            }
+            override fun onStatusChanged(statusText: String, color: Int) {
+                adapter.isDictationMode = true
+                (requireActivity() as? AppCompatActivity)?.supportActionBar?.title = statusText
+                btnDictado.setColorFilter(color)
+            }
+            override fun onVoskModelLoaded() {
+                activity?.runOnUiThread {
+                    Toast.makeText(context, "Modelo de voz listo", Toast.LENGTH_SHORT).show()
+                }
+            }
+            override fun onDictationStopped() {
+                adapter.isDictationMode = false
+                updateActionBarTitle()
+                btnDictado.clearColorFilter()
+                actualizarLista()
+            }
+            override fun onError(errorMsg: String) {
+                if (isAdded) {
+                    Toast.makeText(requireContext(), errorMsg, Toast.LENGTH_LONG).show()
+                }
+            }
+            override fun onSoundSuccess() {
+                emitirSonidoExito()
+            }
+            override fun onSoundError() {
+                emitirSonidoError()
+            }
+        })
+
         btnDictado.setOnClickListener {
-            val mode = requireContext().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).getString(KEY_DICTATION_MODE, MODE_VOSK)
+            val mode = dictationManager.getDictationMode()
             if (mode != MODE_GEMINI) {
-                iniciarFlujoDictado()
+                if (dictationManager.isDictationMode) {
+                    dictationManager.stopDictation()
+                } else {
+                    val seleccion = spinnerEvaluaciones.selectedItem?.toString()
+                    if (seleccion == null || seleccion == ACUMULADO_TEXT) {
+                        Toast.makeText(requireContext(), "Selecciona una evaluación primero", Toast.LENGTH_SHORT).show()
+                    } else if (requireActivity().checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                        requestPermissions(arrayOf(android.Manifest.permission.RECORD_AUDIO, android.Manifest.permission.GET_ACCOUNTS), RC_AUDIO_PERM)
+                    } else {
+                        dictationManager.startDictation(listaAlumnosOriginal)
+                    }
+                }
             }
         }
 
         btnDictado.setOnTouchListener { v, event ->
-            val mode = requireContext().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).getString(KEY_DICTATION_MODE, MODE_VOSK)
+            val mode = dictationManager.getDictationMode()
             if (mode == MODE_GEMINI) {
+                val seleccion = spinnerEvaluaciones.selectedItem?.toString()
+                if (seleccion == null || seleccion == ACUMULADO_TEXT) {
+                    if (event.action == MotionEvent.ACTION_DOWN) {
+                        Toast.makeText(requireContext(), "Selecciona una evaluación primero", Toast.LENGTH_SHORT).show()
+                    }
+                    return@setOnTouchListener false
+                }
+                
                 when (event.action) {
                     MotionEvent.ACTION_DOWN -> {
-                        empezarDictadoGemini()
+                        if (requireActivity().checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                            requestPermissions(arrayOf(android.Manifest.permission.RECORD_AUDIO, android.Manifest.permission.GET_ACCOUNTS), RC_AUDIO_PERM)
+                        } else {
+                            dictationManager.startDictation(listaAlumnosOriginal)
+                        }
                         true
                     }
                     MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                        detenerDictadoGemini()
+                        dictationManager.stopDictation()
                         true
                     }
                     else -> false
@@ -332,8 +402,10 @@ class StudentListFragment : Fragment() {
                             
                             if (wantDictation) {
                                 spinnerEvaluaciones.post {
-                                    if (isAdded && !isDictationMode) {
-                                        iniciarFlujoDictado()
+                                    if (isAdded && !dictationManager.isDictationMode) {
+                                        if (requireActivity().checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) == android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                                            dictationManager.startDictation(listaAlumnosOriginal)
+                                        }
                                     }
                                 }
                             }
@@ -436,36 +508,10 @@ class StudentListFragment : Fragment() {
         return if (eval.esExtra == 1) eval.nombre else "${eval.nombre} (${eval.valor} pts)"
     }
 
-    private fun initVoskModel() {
-        if (voskModel != null || isVoskLoading) return
-        
-        isVoskLoading = true
-        StorageService.unpack(requireContext(), "model-es", "model",
-            { model: Model ->
-                voskModel = model
-                isVoskLoading = false
-                Log.d("VoskDictado", "Modelo cargado exitosamente")
-                activity?.runOnUiThread {
-                    Toast.makeText(context, "Modelo de voz listo", Toast.LENGTH_SHORT).show()
-                }
-            },
-            { exception: Exception ->
-                isVoskLoading = false
-                Log.e("VoskDictado", "Error cargando modelo: ${exception.message}")
-                activity?.runOnUiThread {
-                    Toast.makeText(context, "Error cargando modelo: ${exception.message}", Toast.LENGTH_LONG).show()
-                }
-            })
-    }
 
     fun handleBackPress(): Boolean {
-        if (isDictationMode && currentDictationMatchId != null) {
-            currentDictationMatchId = null
-            currentDictationSuggestedGrade = null
-            actualizarLista()
-            return true
-        } else if (isDictationMode) {
-            detenerDictado()
+        if (this::dictationManager.isInitialized && dictationManager.isDictationMode) {
+            dictationManager.stopDictation()
             return true
         }
         return false
@@ -512,6 +558,32 @@ class StudentListFragment : Fragment() {
                 }
                 
                 Toast.makeText(requireContext(), "Evaluación eliminada", Toast.LENGTH_SHORT).show()
+            }
+            .setNegativeButton("Cancelar", null)
+            .show()
+    }
+
+    fun mostrarDialogoPonerEnBlanco() {
+        val seleccion = spinnerEvaluaciones.selectedItem?.toString() ?: return
+        val evalActual = evaluaciones.find { getEvalDisplayName(it) == seleccion } ?: return
+
+        AlertDialog.Builder(requireContext())
+            .setTitle("¿Poner en blanco?")
+            .setMessage("Se borrarán todas las notas de '${evalActual.nombre}', pero la evaluación se conservará. Esta acción no se puede deshacer.")
+            .setIcon(android.R.drawable.ic_dialog_alert)
+            .setPositiveButton("PONER EN BLANCO") { _, _ ->
+                val ref = database.child("seccion_detalles").child(nrc!!)
+                ref.child("notas").child(evalActual.id).removeValue()
+
+                val currentCodigo = codigoMateria
+                if (currentCodigo != null) {
+                    listaAlumnosOriginal.forEach { est ->
+                        database.child("estudiante_records").child(est.matricula)
+                            .child(currentCodigo).child(evalActual.id).removeValue()
+                    }
+                }
+
+                Toast.makeText(requireContext(), "Notas eliminadas — evaluación conservada", Toast.LENGTH_SHORT).show()
             }
             .setNegativeButton("Cancelar", null)
             .show()
@@ -845,375 +917,21 @@ class StudentListFragment : Fragment() {
                 prefs.edit().putString(KEY_DICTATION_MODE, newMode).apply()
                 Toast.makeText(requireContext(), "Motor cambiado a: ${options[which]}", Toast.LENGTH_SHORT).show()
                 
-                if (newMode == MODE_VOSK && voskModel == null) {
-                    initVoskModel()
-                }
-                
                 dialog.dismiss()
             }
             .setNegativeButton("Cerrar", null)
             .show()
     }
 
-    private fun iniciarFlujoDictado() {
-        val seleccion = spinnerEvaluaciones.selectedItem?.toString()
-        if (seleccion == null || seleccion == ACUMULADO_TEXT) {
-            Toast.makeText(requireContext(), "Selecciona una evaluación primero", Toast.LENGTH_SHORT).show()
-            return
-        }
-        
-        if (requireActivity().checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(arrayOf(android.Manifest.permission.RECORD_AUDIO, android.Manifest.permission.GET_ACCOUNTS), RC_AUDIO_PERM)
-            return
-        }
+    fun isGeminiCorrectionEnabled(): Boolean =
+        if (this::dictationManager.isInitialized) dictationManager.isGeminiCorrectionEnabled() else true
 
-        if (isDictationMode) {
-            detenerDictado()
-        } else {
-            empezarDictado()
-        }
-    }
-
-    private var voskFinalBuffer = StringBuilder()
-
-    private fun empezarDictado() {
-        val prefs = requireContext().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val mode = prefs.getString(KEY_DICTATION_MODE, MODE_VOSK)
-        
-        if (mode == MODE_VOSK) {
-            empezarDictadoVosk()
-        } else {
-            empezarDictadoNative()
-        }
-    }
-
-    private fun empezarDictadoNative() {
-        if (nativeSpeechRecognizer != null) return
-        
-        isDictationMode = true
-        adapter.isDictationMode = true
-        (requireActivity() as? AppCompatActivity)?.supportActionBar?.title = "DICTADO NATIVO (Escuchando...)"
-        btnDictado.setColorFilter(android.graphics.Color.RED)
-        
-        // Limpiar instancia previa si existe para evitar el error 10 (Too many requests)
-        nativeSpeechRecognizer?.destroy()
-        nativeSpeechRecognizer = SpeechRecognizer.createSpeechRecognizer(requireContext())
-
-        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE, "es-US")
-            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-            putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
-        }
-        
-        var isFirstReady = true
-        nativeSpeechRecognizer?.setRecognitionListener(object : RecognitionListener {
-            override fun onReadyForSpeech(params: Bundle?) {
-                if (isFirstReady) {
-                    Toast.makeText(requireContext(), "Dictado nativo listo. Habla ahora.", Toast.LENGTH_SHORT).show()
-                    isFirstReady = false
-                }
-            }
-            override fun onBeginningOfSpeech() {
-                Log.d("DictadoNativo", "Inicio de habla detectado")
-            }
-            override fun onRmsChanged(rmsdB: Float) {}
-            override fun onBufferReceived(buffer: ByteArray?) {}
-            override fun onEndOfSpeech() {
-                Log.d("DictadoNativo", "Fin de habla detectado")
-            }
-            override fun onError(error: Int) {
-                Log.e("DictadoNativo", "Error de dictado: $error")
-                val errorMsg = when(error) {
-                    1 -> "Network timeout"
-                    2 -> "Network error"
-                    3 -> "Audio error"
-                    4 -> "Server error"
-                    5 -> "Client error"
-                    6 -> "Speech timeout"
-                    7 -> "No match"
-                    8 -> "Busy"
-                    9 -> "Insufficient permissions"
-                    10 -> "Too many requests"
-                    11 -> "Server disconnected"
-                    12 -> "Language not supported"
-                    13 -> "Language unavailable"
-                    else -> "Unknown error ($error)"
-                }
-                
-                if (isAdded) {
-                    Toast.makeText(requireContext(), "Error Dictado: $errorMsg", Toast.LENGTH_SHORT).show()
-                }
-
-                if (isDictationMode && (error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT || error == SpeechRecognizer.ERROR_NO_MATCH || error == 7)) {
-                    // Añadir un pequeño retraso para evitar el error 10 (Too many requests)
-                    view?.postDelayed({
-                        if (isDictationMode) nativeSpeechRecognizer?.startListening(intent)
-                    }, 500)
-                } else {
-                    detenerDictado()
-                }
-            }
-            override fun onResults(results: Bundle?) {
-                val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                if (!matches.isNullOrEmpty()) {
-                    procesarTextoDictado(matches[0], true)
-                }
-                if (isDictationMode) {
-                    nativeSpeechRecognizer?.startListening(intent)
-                }
-            }
-            override fun onPartialResults(partialResults: Bundle?) {
-                val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                if (!matches.isNullOrEmpty()) {
-                    procesarTextoDictado(matches[0], false)
-                }
-            }
-            override fun onEvent(eventType: Int, params: Bundle?) {}
-        })
-        
-        nativeSpeechRecognizer?.startListening(intent)
-        actualizarLista()
-    }
-
-    private fun empezarDictadoGemini() {
-        if (audioRecorder == null) audioRecorder = AudioRecorder(requireContext())
-        
-        isDictationMode = true
-        adapter.isDictationMode = true
-        (requireActivity() as? AppCompatActivity)?.supportActionBar?.title = "GEMINI (Grabando...)"
-        btnDictado.setColorFilter(android.graphics.Color.BLUE)
-        
-        geminiStartTime = System.currentTimeMillis()
-        audioRecorder?.startRecording("gemini_audio")
-        actualizarLista()
-    }
-
-    private fun detenerDictadoGemini() {
-        isDictationMode = false
-        adapter.isDictationMode = false
-        updateActionBarTitle()
-        btnDictado.clearColorFilter()
-        
-        val duration = System.currentTimeMillis() - geminiStartTime
-        val audioFile = audioRecorder?.stopRecording()
-        
-        if (duration > 500) {
-            if (audioFile != null && audioFile.exists()) {
-                procesarAudioConGemini(audioFile)
-            }
-        } else {
-            // Ignorar grabaciones demasiado cortas para ahorrar cuota
-            Log.d("GeminiDictado", "Grabación ignorada por ser demasiado corta ($duration ms)")
-        }
-        
-        actualizarLista()
-    }
-
-    private fun procesarAudioConGemini(audioFile: File) {
-        val GEMINI_API_KEY = BuildConfig.GEMINI_API_KEY
-        
-        if (generativeModel == null) {
-            generativeModel = GenerativeModel(
-                modelName = "gemini-flash-latest",
-                apiKey = GEMINI_API_KEY
-            )
-        }
-
-        val alumnosContext = listaAlumnosOriginal.joinToString("\n") { 
-            "${it.matricula}: ${it.nombre}" 
-        }
-
-        val systemPrompt = """
-            Eres un asistente de calificación para la UASD. 
-            Recibirás un audio y una lista de estudiantes. 
-            Tu objetivo es identificar qué nota se le asigna a qué estudiante.
-            
-            REGLAS:
-            1. Solo devuelve un objeto JSON válido.
-            2. Formato: {"updates": [{"id": "ID_ESTUDIANTE", "grade": NOTA_NUMERICA}], "errors": [{"query": "texto", "grade": NOTA}]}
-            3. Si no escuchas una nota clara para alguien, ignóralo.
-            4. Si escuchas algo que parece un nombre y nota pero NO está en la lista, ponlo en "errors".
-            5. La lista de estudiantes es:
-            $alumnosContext
-        """.trimIndent()
-
-        CoroutineScope(Dispatchers.IO).launch {
-            try {
-                val inputAudio = FileInputStream(audioFile).use { it.readBytes() }
-                
-                val content = content {
-                    text(systemPrompt)
-                    blob("audio/mpeg", inputAudio)
-                    text("Procesa este audio y devuelve las actualizaciones de notas.")
-                }
-
-                val response = generativeModel?.generateContent(content)
-                val responseText = response?.text ?: ""
-                
-                val jsonMatch = Regex("\\{.*\\}", RegexOption.DOT_MATCHES_ALL).find(responseText)
-                val jsonString = jsonMatch?.value ?: responseText
-                
-                withContext(Dispatchers.Main) {
-                    aplicarActualizacionesGemini(jsonString)
-                }
-            } catch (e: Exception) {
-                withContext(Dispatchers.Main) {
-                    if (isAdded) {
-                        Toast.makeText(requireContext(), "Error Gemini: ${e.message}", Toast.LENGTH_LONG).show()
-                    }
-                }
-            }
-        }
-    }
-
-    private fun aplicarActualizacionesGemini(jsonString: String) {
-        try {
-            val obj = JSONObject(jsonString)
-            
-            if (obj.has("errors")) {
-                val errors = obj.getJSONArray("errors")
-                if (errors.length() > 0) {
-                    emitirSonidoError()
-                    val firstErr = errors.getJSONObject(0)
-                    if (isAdded) {
-                        Toast.makeText(requireContext(), "No coincidencia: ${firstErr.optString("query")}", Toast.LENGTH_SHORT).show()
-                    }
-                }
-            }
-
-            val updates = obj.getJSONArray("updates")
-            var count = 0
-            
-            for (i in 0 until updates.length()) {
-                val update = updates.getJSONObject(i)
-                val studentId = update.getString("id")
-                val grade = update.getDouble("grade")
-                
-                val est = listaAlumnosOriginal.find { it.matricula == studentId }
-                if (est != null) {
-                    val gradable = GradableEstudiante(est.matricula, est.nombre)
-                    guardarNotaDictado(gradable, grade)
-                    count++
-                }
-            }
-            
-            if (count > 0 && isAdded) {
-                Toast.makeText(requireContext(), "Gemini actualizó $count notas", Toast.LENGTH_SHORT).show()
-            }
-        } catch (e: Exception) {}
-    }
-
-    private fun empezarDictadoVosk() {
-        if (voskModel == null) {
-            if (isVoskLoading) {
-                Toast.makeText(requireContext(), "El modelo aún se está cargando...", Toast.LENGTH_SHORT).show()
-            } else {
-                initVoskModel()
-            }
-            return
-        }
-
-        isDictationMode = true
-        adapter.isDictationMode = true
-        (requireActivity() as? AppCompatActivity)?.supportActionBar?.title = "DICTADO VOSK (Escuchando...)"
-        btnDictado.setColorFilter(android.graphics.Color.RED)
-        voskFinalBuffer.setLength(0)
-        
-        try {
-            val nombres = listaAlumnosOriginal.flatMap { 
-                it.nombre.lowercase().replace(",", "").replace(".", "").split(" ") 
-            }.distinct().filter { it.length > 2 }
-            
-            val nombresCompletos = listaAlumnosOriginal.map { it.nombre.lowercase() }
-            val matriculas = listaAlumnosOriginal.map { it.matricula }
-            val numerosDigitos = (0..100).map { it.toString() }
-            val numerosPalabras = listOf(
-                "cero", "uno", "dos", "tres", "cuatro", "cinco", "seis", "siete", "ocho", "nueve", "diez",
-                "once", "doce", "trece", "catorce", "quince", "dieciséis", "diecisiete", "dieciocho", "diecinueve", "veinte",
-                "veintiuno", "veintidós", "veintitres", "veinticuatro", "veinticinco", "veintiseis", "veintisiete", "veintiocho", "veintinueve", "treinta",
-                "cuarenta", "cincuenta", "sesenta", "setenta", "ochenta", "noventa", "cien", "punto", "coma"
-            )
-            
-            val grammarList = (nombres + nombresCompletos + matriculas + numerosDigitos + numerosPalabras + listOf("[unk]")).distinct()
-            val grammarJson = org.json.JSONArray(grammarList).toString()
-            
-            val rec = Recognizer(voskModel, 16000.0f, grammarJson)
-            voskSpeechService = SpeechService(rec, 16000.0f)
-            voskSpeechService?.startListening(object : VoskRecognitionListener {
-                override fun onPartialResult(hypothesis: String) {
-                    val text = JSONObject(hypothesis).optString("partial")
-                    if (text.isNotEmpty()) {
-                        val currentTotal = if (voskFinalBuffer.isEmpty()) text else "${voskFinalBuffer} $text"
-                        procesarTextoDictado(currentTotal, false)
-                    }
-                }
-
-                override fun onResult(hypothesis: String) {
-                    val text = JSONObject(hypothesis).optString("text")
-                    if (text.isNotEmpty()) {
-                        if (voskFinalBuffer.isNotEmpty()) voskFinalBuffer.append(" ")
-                        voskFinalBuffer.append(text)
-                        procesarTextoDictado(voskFinalBuffer.toString(), true)
-                    }
-                }
-
-                override fun onFinalResult(hypothesis: String) {
-                    val text = JSONObject(hypothesis).optString("text")
-                    if (text.isNotEmpty()) {
-                        if (voskFinalBuffer.isNotEmpty()) voskFinalBuffer.append(" ")
-                        voskFinalBuffer.append(text)
-                        procesarTextoDictado(voskFinalBuffer.toString(), true)
-                    }
-                }
-
-                override fun onError(exception: Exception) {}
-                override fun onTimeout() {}
-            })
-            
-            actualizarLista()
-        } catch (e: Exception) {
-            detenerDictado()
-        }
-    }
-
-    private fun detenerDictado() {
-        val prefs = requireContext().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val mode = prefs.getString(KEY_DICTATION_MODE, MODE_VOSK)
-        
-        if (mode == MODE_VOSK) {
-            detenerDictadoVosk()
-        } else {
-            detenerDictadoNative()
-        }
-    }
-
-    private fun detenerDictadoNative() {
-        isDictationMode = false
-        adapter.isDictationMode = false
-        updateActionBarTitle()
-        btnDictado.clearColorFilter()
-        
-        nativeSpeechRecognizer?.stopListening()
-        nativeSpeechRecognizer?.destroy()
-        nativeSpeechRecognizer = null
-        
-        savedMatchesThisSession.clear()
-        actualizarLista()
-    }
-
-    private fun detenerDictadoVosk() {
-        isDictationMode = false
-        adapter.isDictationMode = false
-        updateActionBarTitle()
-        btnDictado.clearColorFilter()
-        
-        voskSpeechService?.stop()
-        voskSpeechService = null
-        
-        currentDictationMatchId = null
-        currentDictationSuggestedGrade = null
-        actualizarLista()
+    fun toggleGeminiCorrection() {
+        if (!this::dictationManager.isInitialized) return
+        val nuevoEstado = !dictationManager.isGeminiCorrectionEnabled()
+        dictationManager.setGeminiCorrectionEnabled(nuevoEstado)
+        val msg = if (nuevoEstado) "Corrección Gemini activada" else "Corrección Gemini desactivada"
+        if (isAdded) Toast.makeText(requireContext(), msg, Toast.LENGTH_SHORT).show()
     }
 
     private fun updateActionBarTitle() {
@@ -1221,93 +939,6 @@ class StudentListFragment : Fragment() {
             if (!seccion.isNullOrEmpty()) "$materia - $seccion" else materia
         } else {
             "Lista de Estudiantes"
-        }
-    }
-
-    private fun procesarTextoDictado(texto: String, esFinal: Boolean) {
-        if (texto.isEmpty()) return
-        
-        val wordToNum = mapOf(
-            "cero" to 0, "uno" to 1, "dos" to 2, "tres" to 3, "cuatro" to 4, "cinco" to 5,
-            "seis" to 6, "siete" to 7, "ocho" to 8, "nueve" to 9, "diez" to 10,
-            "once" to 11, "doce" to 12, "trece" to 13, "catorce" to 14, "quince" to 15,
-            "dieciséis" to 16, "diecisiete" to 17, "dieciocho" to 18, "diecinueve" to 19, "veinte" to 20,
-            "veintiuno" to 21, "veintidós" to 22, "veintitres" to 23, "veinticuatro" to 24, "veinticinco" to 25,
-            "veintiseis" to 26, "veintisiete" to 27, "veintiocho" to 28, "veintinueve" to 29, "treinta" to 30,
-            "cuarenta" to 40, "cincuenta" to 50, "sesenta" to 60, "setenta" to 70, "ochenta" to 80, "noventa" to 90, "cien" to 100
-        )
-
-        val numWordsRegex = wordToNum.keys.joinToString("|")
-        val namePattern = "(?:(?!\\b(?:$numWordsRegex|\\d+)\\b).)+"
-        val blockRegex = Regex("($namePattern)\\s+\\b(\\d{1,3}([.,]\\d+)?|$numWordsRegex)\\b", RegexOption.IGNORE_CASE)
-        val matches = blockRegex.findAll(texto).toList()
-        
-        var lastMatchEnd = -1
-        
-        for (m in matches) {
-            val query = m.groupValues[1].trim()
-            val gradeStr = m.groupValues[2].lowercase()
-            
-            // Si el nombre es demasiado corto, probablemente es ruido, lo ignoramos incluso como error
-            if (query.length < 3) {
-                lastMatchEnd = m.range.last
-                continue
-            }
-
-            val grade: Double = if (gradeStr.contains(Regex("\\d"))) {
-                gradeStr.replace(',', '.').toDoubleOrNull() ?: continue
-            } else {
-                wordToNum[gradeStr]?.toDouble() ?: continue
-            }
-            
-            val namesList = listaAlumnosOriginal.map { it.nombre }
-            val matchResult = FuzzyMatcher.findBestMatch(query, namesList, "name")
-            
-            val idsList = listaAlumnosOriginal.map { it.matricula }
-            val idMatchResult = FuzzyMatcher.findBestMatch(query, idsList, "id")
-            
-            var bestStudentId: String? = null
-            var bestScore = 0.0
-
-            if (matchResult != null) {
-                if (matchResult.nivelCoincidencia >= 0.5) {
-                    bestStudentId = listaAlumnosOriginal[matchResult.index].matricula
-                    bestScore = matchResult.nivelCoincidencia
-                }
-            }
-
-            if (idMatchResult != null) {
-                if (idMatchResult.nivelCoincidencia >= 0.8) {
-                    if (idMatchResult.nivelCoincidencia > bestScore) {
-                        bestStudentId = listaAlumnosOriginal[idMatchResult.index].matricula
-                    }
-                }
-            }
-
-            if (bestStudentId != null) {
-                val sessionKey = "${bestStudentId}_${grade}"
-                if (!savedMatchesThisSession.contains(sessionKey)) {
-                    val studentObj = listaAlumnosOriginal.find { it.matricula == bestStudentId }
-                    if (studentObj != null) {
-                        val gradable = GradableEstudiante(studentObj.matricula, studentObj.nombre)
-                        guardarNotaDictado(gradable, grade)
-                        resaltarYDesplazarHacia(bestStudentId)
-                        savedMatchesThisSession.add(sessionKey)
-                    }
-                }
-                lastMatchEnd = m.range.last
-            } else {
-                if (esFinal) emitirSonidoError()
-                lastMatchEnd = m.range.last
-            }
-        }
-        
-        if (lastMatchEnd != -1 && isDictationMode) {
-            val rest = if (lastMatchEnd + 1 < voskFinalBuffer.length) {
-                voskFinalBuffer.substring(lastMatchEnd + 1)
-            } else ""
-            voskFinalBuffer.setLength(0)
-            voskFinalBuffer.append(rest.trim())
         }
     }
 
@@ -1350,8 +981,6 @@ class StudentListFragment : Fragment() {
 
         if (nota == null) {
             actualizarNotaEnFirebase(evalActual, alumno.matricula, null)
-            currentDictationMatchId = null
-            currentDictationSuggestedGrade = null
             actualizarLista()
             return
         }
@@ -1371,8 +1000,6 @@ class StudentListFragment : Fragment() {
                 Toast.makeText(requireContext(), msg, Toast.LENGTH_SHORT).show()
             }
             
-            currentDictationMatchId = null
-            currentDictationSuggestedGrade = null
             actualizarLista()
         } else {
             Toast.makeText(requireContext(), "Error: La nota supera el valor máximo (${evalActual.valor})", Toast.LENGTH_SHORT).show()
@@ -1421,19 +1048,9 @@ class StudentListFragment : Fragment() {
 
     override fun onDestroy() {
         super.onDestroy()
-        try {
-            voskSpeechService?.stop()
-        } catch (e: Exception) {
-            Log.e("StudentListFragment", "Error stopping Vosk: ${e.message}")
+        if (this::dictationManager.isInitialized) {
+            dictationManager.release()
         }
-        voskSpeechService = null
-        
-        try {
-            nativeSpeechRecognizer?.destroy()
-        } catch (e: Exception) {
-            Log.e("StudentListFragment", "Error destroying SpeechRecognizer: ${e.message}")
-        }
-        nativeSpeechRecognizer = null
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {}
