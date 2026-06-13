@@ -186,7 +186,9 @@ class DictationManager(
                 "cuarenta", "cincuenta", "sesenta", "setenta", "ochenta", "noventa", "cien", "punto", "coma"
             )
             
-            val grammarList = (nombres + nombresCompletos + matriculas + numerosDigitos + numerosPalabras+ listOf("[unk]")).distinct()
+            //val grammarList = (nombres + nombresCompletos + matriculas + numerosDigitos + numerosPalabras+listOf("Asencio","emanuel","en manuel","emmanuel")+ listOf("[unk]")).distinct()
+            val grammarList = (nombres + nombresCompletos + matriculas + numerosDigitos + numerosPalabras+listOf("asensio","emanuel","ama de ris","ses pe des","ke u ri", "dan al vin","i von ni")).distinct()
+            //val grammarList = (nombres + nombresCompletos + matriculas + numerosDigitos + numerosPalabras).distinct()
             val grammarJson = org.json.JSONArray(grammarList).toString()
 
             val minBufferSize = AudioRecord.getMinBufferSize(
@@ -202,6 +204,10 @@ class DictationManager(
 
             val readBufferSize = maxOf(minBufferSize, 4096)
             voskRecognizer = Recognizer(voskModel, SAMPLE_RATE.toFloat(), grammarJson)
+
+//            val grammar = assets.open("grammar.json").bufferedReader().use { it.readText() }
+//            voskRecognizer.setGrammar(grammar)
+
             voskAudioRecord = AudioRecord(
                 MediaRecorder.AudioSource.VOICE_RECOGNITION,
                 SAMPLE_RATE,

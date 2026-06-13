@@ -4,10 +4,6 @@ import android.content.Intent
 import android.media.AudioManager
 import android.media.ToneGenerator
 import android.os.Bundle
-import android.speech.RecognitionListener
-import android.speech.RecognizerIntent
-import android.speech.SpeechRecognizer
-import android.util.Log
 import android.view.LayoutInflater
 import android.view.MotionEvent
 import android.view.View
@@ -19,6 +15,8 @@ import androidx.fragment.app.Fragment
 import androidx.recyclerview.widget.DividerItemDecoration
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
+import com.google.android.material.chip.Chip
+import com.google.android.material.chip.ChipGroup
 import com.google.firebase.database.*
 import com.google.ai.client.generativeai.GenerativeModel
 import com.google.ai.client.generativeai.type.content
@@ -44,7 +42,7 @@ class StudentListFragment : Fragment() {
         private const val ARG_CODIGO_MATERIA = "codigo_materia"
         private const val ARG_SECCION = "seccion"
         private const val ARG_MATERIA = "materia"
-        private const val ARG_PREV_EVAL_NAME = "prev_eval_name"
+        private const val ARG_PREV_EVAL_ID = "prev_eval_id"
         private const val ARG_WANT_DICTATION = "want_dictation"
         private const val ARG_PREV_QUERY = "prev_query"
 
@@ -55,7 +53,8 @@ class StudentListFragment : Fragment() {
             args.putString(ARG_CODIGO_MATERIA, codigoMateria)
             args.putString(ARG_SECCION, seccion)
             args.putString(ARG_MATERIA, materia)
-            args.putString(ARG_PREV_EVAL_NAME, prevEvalName)
+            // prevEvalName is kept for API compatibility but stored as prevEvalId lookup is done later
+            args.putString(ARG_PREV_EVAL_ID, prevEvalName)
             args.putBoolean(ARG_WANT_DICTATION, wantDictation)
             args.putString(ARG_PREV_QUERY, prevQuery)
             fragment.arguments = args
@@ -68,57 +67,52 @@ class StudentListFragment : Fragment() {
     private lateinit var database: DatabaseReference
     private lateinit var adapter: EstudianteAdapter
     private lateinit var recyclerView: RecyclerView
-    private lateinit var spinnerEvaluaciones: Spinner
     private lateinit var etSearch: EditText
     private lateinit var ivClearSearch: ImageView
     private lateinit var btnDictado: ImageButton
     private lateinit var btnToggleOrden: ImageButton
-    
+
+    // Nuevos elementos UI
+    private lateinit var btnEvaluaciones: LinearLayout
+    private lateinit var btnAsistencias: LinearLayout
+    private lateinit var chipGroupEvaluaciones: ChipGroup
+    private lateinit var tvInfoEstudiantes: TextView
+    private lateinit var btnVerEstadisticas: TextView
+    private lateinit var barraInfoEstudiantes: LinearLayout
+
     private lateinit var viewModel: StudentListViewModel
     private lateinit var repository: GradeRepository
     private val savedMatchesThisSession = mutableSetOf<String>()
-    
-    private lateinit var fabMain: com.google.android.material.floatingactionbutton.FloatingActionButton
-    private lateinit var fabAttendance: com.google.android.material.floatingactionbutton.FloatingActionButton
-    private lateinit var fabNewEval: com.google.android.material.floatingactionbutton.FloatingActionButton
-    private lateinit var fabExtraPoints: com.google.android.material.floatingactionbutton.FloatingActionButton
-    
-    private lateinit var layoutFabAttendance: android.widget.LinearLayout
-    private lateinit var layoutFabNewEval: android.widget.LinearLayout
-    private lateinit var layoutFabExtra: android.widget.LinearLayout
-    private lateinit var fabMenuContainer: android.widget.LinearLayout
-    
-    private var isFabOpen = false
-    
+
     private var nrc: String? = null
     private var codigoMateria: String? = null
     private var seccion: String? = null
     private var materia: String? = null
-    private var prevEvalName: String? = null
+    private var prevEvalNameArg: String? = null
     private var wantDictation: Boolean = false
     private var currentQuery: String = ""
-    private var pendingSelectEvalId: String? = null
-    
+
+    // Evaluación seleccionada actualmente (null = Acumulado Total)
+    private var selectedEvalId: String? = null
+
     private lateinit var dictationManager: DictationManager
-    
+
     val isDictationMode: Boolean
         get() = if (this::dictationManager.isInitialized) dictationManager.isDictationMode else false
-        
+
     private var searchJob: Job? = null
-    
+
     private val PREFS_NAME = "uasd_prefs"
     private val KEY_LAST_EXTRA = "last_extra_points"
     private val KEY_DICTATION_MODE = "dictation_mode"
     private val MODE_VOSK = "vosk"
     private val MODE_NATIVE = "native"
     private val MODE_GEMINI = "gemini"
-    
+
     private val listaAlumnosOriginal = mutableListOf<Estudiante>()
     private val evaluaciones = mutableListOf<Evaluacion>()
     private val todasLasNotas = mutableMapOf<String, MutableMap<String, Double>>()
     private val observacionesMap = mutableMapOf<String, String>()
-    
-    private val ACUMULADO_TEXT = "--- Acumulado Total ---"
 
     interface OnSearchListener {
         fun onEmptySearch(query: String)
@@ -145,17 +139,17 @@ class StudentListFragment : Fragment() {
             codigoMateria = it.getString(ARG_CODIGO_MATERIA)
             seccion = it.getString(ARG_SECCION)
             materia = it.getString(ARG_MATERIA)
-            prevEvalName = it.getString(ARG_PREV_EVAL_NAME)
+            prevEvalNameArg = it.getString(ARG_PREV_EVAL_ID)
             wantDictation = it.getBoolean(ARG_WANT_DICTATION)
             val prevQ = it.getString(ARG_PREV_QUERY)
             if (prevQ != null && currentQuery.isEmpty()) {
                 currentQuery = prevQ
             }
         }
-        
+
         savedInstanceState?.let {
             currentQuery = it.getString("currentQuery", "")
-            pendingSelectEvalId = it.getString("selectedEvalId")
+            selectedEvalId = it.getString("selectedEvalId")
         }
     }
 
@@ -167,15 +161,41 @@ class StudentListFragment : Fragment() {
         super.onViewCreated(view, savedInstanceState)
 
         recyclerView = view.findViewById(R.id.recyclerViewStudents)
-        spinnerEvaluaciones = view.findViewById(R.id.spinnerEvaluaciones)
         etSearch = view.findViewById(R.id.etSearch)
         ivClearSearch = view.findViewById(R.id.ivClearSearch)
         btnDictado = view.findViewById(R.id.btnDictado)
+        btnToggleOrden = view.findViewById(R.id.btnToggleOrden)
+
+        btnEvaluaciones = view.findViewById(R.id.btnEvaluaciones)
+        btnAsistencias = view.findViewById(R.id.btnAsistencias)
+        chipGroupEvaluaciones = view.findViewById(R.id.chipGroupEvaluaciones)
+        tvInfoEstudiantes = view.findViewById(R.id.tvInfoEstudiantes)
+        btnVerEstadisticas = view.findViewById(R.id.btnVerEstadisticas)
+        barraInfoEstudiantes = view.findViewById(R.id.barraInfoEstudiantes)
 
         ivClearSearch.setOnClickListener {
             etSearch.text.clear()
         }
 
+        // ── Botones de acceso directo ────────────────────────────────────────
+        btnEvaluaciones.setOnClickListener {
+            mostrarBottomSheetEvaluaciones()
+        }
+
+        btnAsistencias.setOnClickListener {
+            val intent = Intent(requireContext(), AttendanceActivity::class.java).apply {
+                putExtra("NRC", nrc)
+                putExtra("MATERIA", materia)
+            }
+            startActivity(intent)
+        }
+
+        // ── Franja informativa ───────────────────────────────────────────────
+        btnVerEstadisticas.setOnClickListener {
+            mostrarEstadisticas()
+        }
+
+        // ── Dictado ──────────────────────────────────────────────────────────
         dictationManager = DictationManager(requireContext(), object : DictationManager.DictationCallback {
             override fun onGradeRecognized(matricula: String, nombre: String, grade: Double) {
                 val sessionKey = "${matricula}_${grade}"
@@ -235,8 +255,7 @@ class StudentListFragment : Fragment() {
                 if (dictationManager.isDictationMode) {
                     dictationManager.stopDictation()
                 } else {
-                    val seleccion = spinnerEvaluaciones.selectedItem?.toString()
-                    if (seleccion == null || seleccion == ACUMULADO_TEXT) {
+                    if (selectedEvalId == null) {
                         Toast.makeText(requireContext(), "Selecciona una evaluación primero", Toast.LENGTH_SHORT).show()
                     } else if (requireActivity().checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
                         requestPermissions(arrayOf(android.Manifest.permission.RECORD_AUDIO, android.Manifest.permission.GET_ACCOUNTS), RC_AUDIO_PERM)
@@ -250,14 +269,13 @@ class StudentListFragment : Fragment() {
         btnDictado.setOnTouchListener { v, event ->
             val mode = dictationManager.getDictationMode()
             if (mode == MODE_GEMINI) {
-                val seleccion = spinnerEvaluaciones.selectedItem?.toString()
-                if (seleccion == null || seleccion == ACUMULADO_TEXT) {
+                if (selectedEvalId == null) {
                     if (event.action == MotionEvent.ACTION_DOWN) {
                         Toast.makeText(requireContext(), "Selecciona una evaluación primero", Toast.LENGTH_SHORT).show()
                     }
                     return@setOnTouchListener false
                 }
-                
+
                 when (event.action) {
                     MotionEvent.ACTION_DOWN -> {
                         if (requireActivity().checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
@@ -280,9 +298,9 @@ class StudentListFragment : Fragment() {
 
         recyclerView.layoutManager = LinearLayoutManager(requireContext())
         recyclerView.addItemDecoration(DividerItemDecoration(requireContext(), DividerItemDecoration.VERTICAL))
-        
+
         adapter = EstudianteAdapter(emptyList(), false, false, { alumno ->
-            if (spinnerEvaluaciones.selectedItem?.toString() != ACUMULADO_TEXT) {
+            if (selectedEvalId != null) {
                 mostrarDialogoNota(alumno)
             } else {
                 mostrarDetalleNotas(alumno)
@@ -294,42 +312,6 @@ class StudentListFragment : Fragment() {
         })
         recyclerView.adapter = adapter
 
-        recyclerView.clipToPadding = false
-        val extraPadding = (120 * resources.displayMetrics.density).toInt()
-        recyclerView.setPadding(recyclerView.paddingLeft, recyclerView.paddingTop, recyclerView.paddingRight, extraPadding)
-
-        fabMain = view.findViewById(R.id.fabMain)
-        fabAttendance = view.findViewById(R.id.fabAttendance)
-        fabNewEval = view.findViewById(R.id.fabNewEval)
-        fabExtraPoints = view.findViewById(R.id.fabExtraPoints)
-        
-        layoutFabAttendance = view.findViewById(R.id.fabActionAttendance)
-        layoutFabNewEval = view.findViewById(R.id.fabActionNewEval)
-        layoutFabExtra = view.findViewById(R.id.fabActionExtra)
-        fabMenuContainer = view.findViewById(R.id.fabMenuContainer)
-
-        fabMain.setOnClickListener { toggleFabMenu() }
-        
-        fabAttendance.setOnClickListener {
-            closeFabMenu()
-            val intent = Intent(requireContext(), AttendanceActivity::class.java).apply {
-                putExtra("NRC", nrc)
-                putExtra("MATERIA", materia)
-            }
-            startActivity(intent)
-        }
-        
-        fabNewEval.setOnClickListener { 
-            closeFabMenu()
-            mostrarDialogoNuevaEvaluacion() 
-        }
-        
-        fabExtraPoints.setOnClickListener { 
-            closeFabMenu()
-            gestionarPuntosExtra() 
-        }
-
-        btnToggleOrden = view.findViewById(R.id.btnToggleOrden)
         btnToggleOrden.setOnClickListener {
             viewModel.alternarOrdenLista()
         }
@@ -338,17 +320,15 @@ class StudentListFragment : Fragment() {
             database = FirebaseDatabase.getInstance().reference
             repository = GradeRepository(database)
             viewModel = StudentListViewModel(repository, nrc!!, codigoMateria ?: "")
-            
+
             viewModel.estudiantes.observe(viewLifecycleOwner) { lista ->
                 adapter.updateData(lista)
-                
-                // Keep local lists synchronized for helper dialogs and voice recognizers
+
                 listaAlumnosOriginal.clear()
-                lista.forEach { 
+                lista.forEach {
                     listaAlumnosOriginal.add(Estudiante(it.matricula, it.nombre))
                 }
-                
-                // If there's a pending highlighted student, scroll to them now that the list has been updated and reordered
+
                 adapter.highlightedStudentId?.let { matricula ->
                     val index = lista.indexOfFirst { it.matricula == matricula }
                     if (index != -1) {
@@ -357,8 +337,10 @@ class StudentListFragment : Fragment() {
                         }
                     }
                 }
+
+                actualizarBarraInfo()
             }
-            
+
             viewModel.ordenLista.observe(viewLifecycleOwner) { orden ->
                 val imageRes = if (orden == OrdenListaEstudiantes.FECHA_EDICION) {
                     android.R.drawable.ic_menu_sort_alphabetically
@@ -372,70 +354,40 @@ class StudentListFragment : Fragment() {
                 evaluaciones.clear()
                 evaluaciones.addAll(evals)
 
-                val nombresEval = mutableListOf(ACUMULADO_TEXT)
-                evals.forEach { nombresEval.add(getEvalDisplayName(it)) }
-                
-                val currentContext = context ?: return@observe
-                val spinnerAdapter = ArrayAdapter(currentContext, android.R.layout.simple_spinner_item, nombresEval)
-                spinnerAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
-                spinnerEvaluaciones.adapter = spinnerAdapter
+                actualizarChips(evals)
 
-                val seleccionActual = spinnerEvaluaciones.selectedItem?.toString()
-                
-                if (pendingSelectEvalId != null) {
-                    val targetEval = evaluaciones.find { it.id == pendingSelectEvalId }
-                    if (targetEval != null) {
-                        val displayName = getEvalDisplayName(targetEval)
-                        val pos = nombresEval.indexOf(displayName)
-                        if (pos != -1) {
-                            spinnerEvaluaciones.setSelection(pos)
-                            pendingSelectEvalId = null
-                        }
-                    }
-                } else if (prevEvalName != null) {
-                    val match = evaluaciones.find { it.nombre.trim().equals(prevEvalName?.trim(), ignoreCase = true) }
+                // Restaurar selección previa por nombre (compatibilidad con cambio de sección)
+                if (selectedEvalId == null && prevEvalNameArg != null) {
+                    val match = evals.find { it.nombre.trim().equals(prevEvalNameArg?.trim(), ignoreCase = true) }
                     if (match != null) {
-                        val displayName = getEvalDisplayName(match)
-                        val pos = nombresEval.indexOf(displayName)
-                        if (pos != -1) {
-                            spinnerEvaluaciones.setSelection(pos)
-                            
-                            if (wantDictation) {
-                                spinnerEvaluaciones.post {
-                                    if (isAdded && !dictationManager.isDictationMode) {
-                                        if (requireActivity().checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) == android.content.pm.PackageManager.PERMISSION_GRANTED) {
-                                            dictationManager.startDictation(listaAlumnosOriginal)
-                                        }
+                        seleccionarEval(match)
+                        if (wantDictation) {
+                            chipGroupEvaluaciones.post {
+                                if (isAdded && !dictationManager.isDictationMode) {
+                                    if (requireActivity().checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) == android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                                        dictationManager.startDictation(listaAlumnosOriginal)
                                     }
                                 }
                             }
                         }
-                        prevEvalName = null
+                        prevEvalNameArg = null
                         wantDictation = false
-                    } else if (evaluaciones.isNotEmpty()) {
-                        prevEvalName = null
+                    } else if (evals.isNotEmpty()) {
+                        prevEvalNameArg = null
                         wantDictation = false
-                    }
-                } else if (seleccionActual == null || seleccionActual == ACUMULADO_TEXT) {
-                    val targetEval = if (pendingSelectEvalId != null) {
-                        evaluaciones.find { it.id == pendingSelectEvalId }
-                    } else {
-                        evaluaciones.find { it.esExtra == 1 }
-                    }
-                    
-                    if (targetEval != null) {
-                        val displayName = getEvalDisplayName(targetEval)
-                        val pos = nombresEval.indexOf(displayName)
-                        if (pos != -1) {
-                            spinnerEvaluaciones.setSelection(pos)
-                            pendingSelectEvalId = null
-                        }
                     }
                 }
+
+                // Mantener la selección actual si el eval todavía existe
+                if (selectedEvalId != null && evals.none { it.id == selectedEvalId }) {
+                    selectedEvalId = null
+                    viewModel.setSelectedEvalName("--- Acumulado Total ---")
+                    actualizarBarraInfo()
+                }
             }
-            // Bind ViewModel's internal structures to local maps so helper dialogs have local data access
+
+            // Mantener todasLasNotas sincronizadas para los diálogos
             viewModel.estudiantes.observe(viewLifecycleOwner) {
-                // Keep todasLasNotas and observacionesMap synchronized for helper detail dialogs
                 todasLasNotas.clear()
                 observacionesMap.clear()
                 viewModel.evaluaciones.value?.forEach { eval ->
@@ -450,30 +402,6 @@ class StudentListFragment : Fragment() {
                     }
                     todasLasNotas[eval.id] = map
                 }
-            }
-
-            // Data loading is triggered automatically by ViewModel's init block.
-            
-            spinnerEvaluaciones.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
-                override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
-                    val sel = spinnerEvaluaciones.selectedItem?.toString() ?: ACUMULADO_TEXT
-                    viewModel.setSelectedEvalName(sel)
-                    
-                    // Show or hide sort button based on selection (only active for individual evaluations, not total cumulative)
-                    if (sel == ACUMULADO_TEXT) {
-                        btnToggleOrden.visibility = View.GONE
-                        adapter.mostrarOrdenCaptura = false
-                    } else {
-                        btnToggleOrden.visibility = View.VISIBLE
-                        viewModel.ordenLista.value?.let {
-                            adapter.mostrarOrdenCaptura = (it == OrdenListaEstudiantes.FECHA_EDICION)
-                        }
-                    }
-                    
-                    actualizarLista()
-                    activity?.invalidateOptionsMenu()
-                }
-                override fun onNothingSelected(parent: AdapterView<*>?) {}
             }
 
             etSearch.addTextChangedListener(object : android.text.TextWatcher {
@@ -491,23 +419,126 @@ class StudentListFragment : Fragment() {
                 ivClearSearch.visibility = View.VISIBLE
             }
         }
-        
-        // Vosk model initialization is now loaded lazily inside iniciarFlujoDictado / empezarDictadoVosk
-        // to prevent UI freezing and heavy memory load when switching sections.
     }
 
+    // ── Chips de selección rápida ────────────────────────────────────────────
+
+    private fun actualizarChips(evals: List<Evaluacion>) {
+        if (!isAdded) return
+        chipGroupEvaluaciones.removeAllViews()
+
+        evals.forEach { eval ->
+            val chip = Chip(requireContext()).apply {
+                text = eval.nombre
+                isCheckable = true
+                isChecked = (eval.id == selectedEvalId)
+                tag = eval.id
+                setOnCheckedChangeListener { _, isChecked ->
+                    if (isChecked) {
+                        seleccionarEval(eval)
+                    } else {
+                        // If we uncheck the currently selected evaluation, go back to cumulative total
+                        if (selectedEvalId == eval.id) {
+                            deseleccionarEval()
+                        }
+                    }
+                }
+            }
+            chipGroupEvaluaciones.addView(chip)
+        }
+
+        // Si hay un chip seleccionado, asegurar que el ChipGroup lo refleje
+        actualizarSeleccionChip()
+    }
+
+    private fun actualizarSeleccionChip() {
+        for (i in 0 until chipGroupEvaluaciones.childCount) {
+            val chip = chipGroupEvaluaciones.getChildAt(i) as? Chip ?: continue
+            chip.isChecked = (chip.tag as? String == selectedEvalId)
+        }
+    }
+
+    private fun seleccionarEval(eval: Evaluacion) {
+        selectedEvalId = eval.id
+        viewModel.setSelectedEvalName("${eval.nombre} (${eval.valor} pts)")
+        actualizarSeleccionChip()
+        btnToggleOrden.visibility = View.VISIBLE
+        viewModel.ordenLista.value?.let {
+            adapter.mostrarOrdenCaptura = (it == OrdenListaEstudiantes.FECHA_EDICION)
+        }
+        actualizarBarraInfo()
+        actualizarLista()
+        activity?.invalidateOptionsMenu()
+    }
+
+    private fun deseleccionarEval() {
+        selectedEvalId = null
+        viewModel.setSelectedEvalName("--- Acumulado Total ---")
+        actualizarSeleccionChip()
+        btnToggleOrden.visibility = View.GONE
+        adapter.mostrarOrdenCaptura = false
+        actualizarBarraInfo()
+        actualizarLista()
+        activity?.invalidateOptionsMenu()
+    }
+
+    // ── BottomSheet de evaluaciones ──────────────────────────────────────────
+
+    private fun mostrarBottomSheetEvaluaciones() {
+        val sheet = EvaluacionesBottomSheet.newInstance(evaluaciones.toList(), selectedEvalId)
+        sheet.listener = object : EvaluacionesBottomSheet.Listener {
+            override fun onEvalSelected(eval: Evaluacion) {
+                seleccionarEval(eval)
+            }
+            override fun onNuevaEvaluacion() {
+                mostrarDialogoNuevaEvaluacion()
+            }
+            override fun onEditarEval(eval: Evaluacion) {
+                mostrarDialogoEditarEvaluacion(eval)
+            }
+            override fun onEliminarEval(eval: Evaluacion) {
+                eliminarEvaluacion(eval)
+            }
+        }
+        sheet.show(parentFragmentManager, "EvaluacionesBottomSheet")
+    }
+
+    // ── Franja informativa ───────────────────────────────────────────────────
+
+    private fun actualizarBarraInfo() {
+        if (!isAdded) return
+        val totalEstudiantes = listaAlumnosOriginal.size
+        if (totalEstudiantes == 0) {
+            tvInfoEstudiantes.text = "Sin estudiantes"
+            return
+        }
+
+        val evalActual = evaluaciones.find { it.id == selectedEvalId }
+
+        if (evalActual == null) {
+            // Acumulado: mostrar cuántos tienen al menos una nota
+            val conNota = listaAlumnosOriginal.count { est ->
+                todasLasNotas.values.any { notasMap -> notasMap.containsKey(est.matricula) }
+            }
+            tvInfoEstudiantes.text = "$conNota / $totalEstudiantes con alguna nota"
+            btnVerEstadisticas.visibility = View.INVISIBLE
+        } else {
+            val notasEval = todasLasNotas[evalActual.id] ?: emptyMap()
+            val conNota = listaAlumnosOriginal.count { notasEval.containsKey(it.matricula) }
+            val labelTipo = if (evalActual.esExtra == 1) "con puntos extra" else "con nota"
+            tvInfoEstudiantes.text = "$conNota / $totalEstudiantes $labelTipo"
+            btnVerEstadisticas.visibility = View.VISIBLE
+        }
+    }
+
+    // ── API pública para StudentListActivity ─────────────────────────────────
+
     fun getSelectedEvalName(): String? {
-        val seleccion = spinnerEvaluaciones.selectedItem?.toString() ?: return null
-        if (seleccion == ACUMULADO_TEXT) return null
-        return evaluaciones.find { getEvalDisplayName(it) == seleccion }?.nombre
+        val eval = evaluaciones.find { it.id == selectedEvalId } ?: return null
+        return eval.nombre
     }
 
     fun getCurrentSearchQuery(): String = currentQuery
-
-    private fun getEvalDisplayName(eval: Evaluacion): String {
-        return if (eval.esExtra == 1) eval.nombre else "${eval.nombre} (${eval.valor} pts)"
-    }
-
 
     fun handleBackPress(): Boolean {
         if (this::dictationManager.isInitialized && dictationManager.isDictationMode) {
@@ -516,10 +547,6 @@ class StudentListFragment : Fragment() {
         }
         return false
     }
-
-    // Database listeners are managed inside the StudentListViewModel to prevent leaks and double fetches.
-
-    // Note: LiveData observers are cleaned up by viewLifecycleOwner automatically.
 
     private fun actualizarLista() {
         if (!isAdded) return
@@ -535,10 +562,14 @@ class StudentListFragment : Fragment() {
         }
     }
 
-    fun mostrarDialogoEliminarEvaluacion() {
-        val seleccion = spinnerEvaluaciones.selectedItem?.toString() ?: return
-        val evalActual = evaluaciones.find { getEvalDisplayName(it) == seleccion } ?: return
+    // ── Diálogos ─────────────────────────────────────────────────────────────
 
+    fun mostrarDialogoEliminarEvaluacion() {
+        val evalActual = evaluaciones.find { it.id == selectedEvalId } ?: return
+        eliminarEvaluacion(evalActual)
+    }
+
+    private fun eliminarEvaluacion(evalActual: Evaluacion) {
         AlertDialog.Builder(requireContext())
             .setTitle("¿Eliminar evaluación?")
             .setMessage("Estás a punto de borrar '${evalActual.nombre}'.\n\n¡ATENCION! Se borrarán permanentemente todas las notas registradas para esta evaluación. Esta acción no se puede deshacer.")
@@ -547,8 +578,7 @@ class StudentListFragment : Fragment() {
                 val ref = database.child("seccion_detalles").child(nrc!!)
                 ref.child("evaluaciones").child(evalActual.id).removeValue()
                 ref.child("notas").child(evalActual.id).removeValue()
-                
-                // Limpiar también en los records individuales de los estudiantes
+
                 val currentCodigo = codigoMateria
                 if (currentCodigo != null) {
                     listaAlumnosOriginal.forEach { est ->
@@ -556,7 +586,11 @@ class StudentListFragment : Fragment() {
                             .child(currentCodigo).child(evalActual.id).removeValue()
                     }
                 }
-                
+
+                if (selectedEvalId == evalActual.id) {
+                    deseleccionarEval()
+                }
+
                 Toast.makeText(requireContext(), "Evaluación eliminada", Toast.LENGTH_SHORT).show()
             }
             .setNegativeButton("Cancelar", null)
@@ -564,8 +598,7 @@ class StudentListFragment : Fragment() {
     }
 
     fun mostrarDialogoPonerEnBlanco() {
-        val seleccion = spinnerEvaluaciones.selectedItem?.toString() ?: return
-        val evalActual = evaluaciones.find { getEvalDisplayName(it) == seleccion } ?: return
+        val evalActual = evaluaciones.find { it.id == selectedEvalId } ?: return
 
         AlertDialog.Builder(requireContext())
             .setTitle("¿Poner en blanco?")
@@ -589,27 +622,6 @@ class StudentListFragment : Fragment() {
             .show()
     }
 
-    private fun gestionarPuntosExtra() {
-        val extraEval = evaluaciones.find { it.esExtra == 1 }
-        if (extraEval != null) {
-            val displayName = getEvalDisplayName(extraEval)
-            for (i in 0 until spinnerEvaluaciones.adapter.count) {
-                if (spinnerEvaluaciones.adapter.getItem(i).toString() == displayName) {
-                    spinnerEvaluaciones.setSelection(i)
-                    break
-                }
-            }
-        } else {
-            val ref = database.child("seccion_detalles").child(nrc!!).child("evaluaciones")
-            val id = ref.push().key ?: ""
-            pendingSelectEvalId = id
-            val eval = Evaluacion(id, "PUNTOS EXTRA", 100, 1)
-            database.child("seccion_detalles").child(nrc!!).child("evaluaciones").child(id).setValue(eval)
-            // No es estrictamente necesario inicializar el record aquí ya que no hay nota aún,
-            // pero si se quisiera se podría hacer.
-        }
-    }
-
     private fun mostrarDialogoNuevaEvaluacion() {
         val view = LayoutInflater.from(requireContext()).inflate(R.layout.dialog_evaluacion, null)
         val etNombre = view.findViewById<EditText>(R.id.etNombreEval)
@@ -626,9 +638,11 @@ class StudentListFragment : Fragment() {
                 val currentCodigoMateria = codigoMateria
                 if (nombre.isNotEmpty() && valor > 0 && currentNrc != null) {
                     val id = database.child("seccion_detalles").child(currentNrc).child("evaluaciones").push().key ?: ""
-                    pendingSelectEvalId = id
                     val eval = Evaluacion(id, nombre, valor, 0)
                     database.child("seccion_detalles").child(currentNrc).child("evaluaciones").child(id).setValue(eval)
+
+                    // Seleccionar automáticamente la nueva evaluación
+                    chipGroupEvaluaciones.post { seleccionarEval(eval) }
 
                     if (cbCrearOtrasSecciones.isChecked) {
                         database.child("secciones").addListenerForSingleValueEvent(object : ValueEventListener {
@@ -655,16 +669,12 @@ class StudentListFragment : Fragment() {
                                                         database.child("seccion_detalles").child(otherNrc).child("evaluaciones").child(newId).setValue(newEval)
                                                     }
                                                 }
-                                                override fun onCancelled(error: DatabaseError) {
-                                                    Log.e("StudentListFragment", "Error checking evaluations for section $otherNrc: ${error.message}")
-                                                }
+                                                override fun onCancelled(error: DatabaseError) {}
                                             })
                                     }
                                 }
                             }
-                            override fun onCancelled(error: DatabaseError) {
-                                Log.e("StudentListFragment", "Error fetching sections: ${error.message}")
-                            }
+                            override fun onCancelled(error: DatabaseError) {}
                         })
                     }
                 }
@@ -696,15 +706,14 @@ class StudentListFragment : Fragment() {
     }
 
     private fun mostrarDialogoNota(alumno: GradableEstudiante) {
-        val seleccion = spinnerEvaluaciones.selectedItem?.toString() ?: return
-        val evalActual = evaluaciones.find { getEvalDisplayName(it) == seleccion } ?: return
-        
+        val evalActual = evaluaciones.find { it.id == selectedEvalId } ?: return
+
         val etNota = EditText(requireContext())
         etNota.inputType = android.text.InputType.TYPE_CLASS_NUMBER or android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL
-        
+
         val notaActual = if (alumno.nota > -1) alumno.nota else 0.0
         if (alumno.nota > -1) etNota.setText(alumno.nota.toString())
-        
+
         etNota.setPadding(60, 40, 60, 40)
 
         val builder = AlertDialog.Builder(requireContext())
@@ -715,7 +724,7 @@ class StudentListFragment : Fragment() {
         if (evalActual.esExtra == 1) {
             builder.setTitle("${alumno.nombre} (Ptos Extra)")
             etNota.hint = "Cantidad a sumar (ej: 0.5)"
-            
+
             val prefs = requireContext().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             val lastExtra = prefs.getFloat(KEY_LAST_EXTRA, 0.0f)
             if (lastExtra > 0) {
@@ -724,7 +733,7 @@ class StudentListFragment : Fragment() {
             } else {
                 etNota.setText("")
             }
-            
+
             builder.setPositiveButton("Sumar") { _, _ ->
                 val incremento = etNota.text.toString().toDoubleOrNull() ?: 0.0
                 if (incremento > 0) {
@@ -748,9 +757,6 @@ class StudentListFragment : Fragment() {
         } else {
             builder.setPositiveButton("Guardar") { _, _ ->
                 val input = etNota.text.toString().trim()
-                val ref = database.child("seccion_detalles").child(nrc!!)
-                        .child("notas").child(evalActual.id).child(alumno.matricula)
-                
                 if (input.isEmpty()) {
                     actualizarNotaEnFirebase(evalActual, alumno.matricula, null)
                 } else {
@@ -766,7 +772,7 @@ class StudentListFragment : Fragment() {
                 actualizarNotaEnFirebase(evalActual, alumno.matricula, evalActual.valor.toDouble())
             }
         }
-        
+
         builder.show()
     }
 
@@ -853,12 +859,13 @@ class StudentListFragment : Fragment() {
     }
 
     fun mostrarEstadisticas() {
-        val seleccion = spinnerEvaluaciones.selectedItem?.toString() ?: return
-        val evalActual = evaluaciones.find { getEvalDisplayName(it) == seleccion } ?: return
-        
+        val evalActual = evaluaciones.find { it.id == selectedEvalId } ?: run {
+            Toast.makeText(requireContext(), "Selecciona una evaluación primero", Toast.LENGTH_SHORT).show()
+            return
+        }
+
         val notasMap = todasLasNotas[evalActual.id] ?: emptyMap<String, Double>()
-        
-        // Filtrar para considerar solo alumnos que pertenecen oficialmente a esta sección
+
         val matriculasDeEstaSeccion = listaAlumnosOriginal.map { it.matricula }.toSet()
         val notas = notasMap.filter { matriculasDeEstaSeccion.contains(it.key) }
                            .values.filter { it >= 0 }
@@ -892,9 +899,9 @@ class StudentListFragment : Fragment() {
     fun mostrarConfiguracionDictado() {
         val prefs = requireContext().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val currentMode = prefs.getString(KEY_DICTATION_MODE, MODE_VOSK)
-        
+
         val options = arrayOf(
-            "Vosk (Offline - Más preciso)", 
+            "Vosk (Offline - Más preciso)",
             "Android Nativo (Online - Rápido)",
             "Gemini AI (Inteligente - Hold to talk)"
         )
@@ -904,7 +911,7 @@ class StudentListFragment : Fragment() {
             MODE_GEMINI -> 2
             else -> 0
         }
-        
+
         AlertDialog.Builder(requireContext())
             .setTitle("Motor de Dictado")
             .setSingleChoiceItems(options, checkedItem) { dialog, which ->
@@ -916,7 +923,7 @@ class StudentListFragment : Fragment() {
                 }
                 prefs.edit().putString(KEY_DICTATION_MODE, newMode).apply()
                 Toast.makeText(requireContext(), "Motor cambiado a: ${options[which]}", Toast.LENGTH_SHORT).show()
-                
+
                 dialog.dismiss()
             }
             .setNegativeButton("Cerrar", null)
@@ -961,7 +968,7 @@ class StudentListFragment : Fragment() {
         if (posicion != -1) {
             adapter.highlightedStudentId = matricula
             adapter.notifyItemChanged(posicion)
-            
+
             CoroutineScope(Dispatchers.Main).launch {
                 kotlinx.coroutines.delay(1500)
                 if (isAdded && adapter.highlightedStudentId == matricula) {
@@ -976,8 +983,7 @@ class StudentListFragment : Fragment() {
     }
 
     private fun guardarNotaDictado(alumno: GradableEstudiante, nota: Double?) {
-        val seleccion = spinnerEvaluaciones.selectedItem?.toString() ?: return
-        val evalActual = evaluaciones.find { getEvalDisplayName(it) == seleccion } ?: return
+        val evalActual = evaluaciones.find { it.id == selectedEvalId } ?: return
 
         if (nota == null) {
             actualizarNotaEnFirebase(evalActual, alumno.matricula, null)
@@ -999,7 +1005,7 @@ class StudentListFragment : Fragment() {
             if (isAdded) {
                 Toast.makeText(requireContext(), msg, Toast.LENGTH_SHORT).show()
             }
-            
+
             actualizarLista()
         } else {
             Toast.makeText(requireContext(), "Error: La nota supera el valor máximo (${evalActual.valor})", Toast.LENGTH_SHORT).show()
@@ -1012,34 +1018,58 @@ class StudentListFragment : Fragment() {
         repository.actualizarNotaConNombreEval(currentNrc, currentCodigo, eval.id, eval.nombre, matricula, nota)
     }
 
-    private fun toggleFabMenu() {
-        if (!isFabOpen) {
-            showFabMenu()
-        } else {
-            closeFabMenu()
+    fun tieneEvaluacionIndividualSeleccionada(): Boolean {
+        if (selectedEvalId == null) return false
+        return evaluaciones.any { it.id == selectedEvalId && it.esExtra == 0 }
+    }
+
+    fun mostrarDialogoEditarNombreEvaluacion() {
+        val evalActual = evaluaciones.find { it.id == selectedEvalId } ?: return
+        mostrarDialogoEditarEvaluacion(evalActual)
+    }
+
+    private fun mostrarDialogoEditarEvaluacion(evalActual: Evaluacion) {
+        val layout = LinearLayout(requireContext()).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(60, 40, 60, 40)
         }
-    }
 
-    private fun showFabMenu() {
-        isFabOpen = true
-        fabMain.animate().rotation(45f)
-        fabMenuContainer.visibility = View.VISIBLE
-        fabMenuContainer.alpha = 0f
-        fabMenuContainer.translationY = 50f
-        fabMenuContainer.animate()
-            .alpha(1f)
-            .translationY(0f)
-            .setDuration(200)
-    }
+        val etNombre = EditText(requireContext()).apply {
+            hint = "Nombre de la evaluación"
+            setText(evalActual.nombre)
+            inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+        }
+        val etValor = EditText(requireContext()).apply {
+            hint = "Valor en puntos"
+            setText(if (evalActual.esExtra == 1) "" else evalActual.valor.toString())
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = 16 }
+        }
 
-    private fun closeFabMenu() {
-        isFabOpen = false
-        fabMain.animate().rotation(0f)
-        fabMenuContainer.animate()
-            .alpha(0f)
-            .translationY(50f)
-            .setDuration(200)
-            .withEndAction { fabMenuContainer.visibility = View.GONE }
+        layout.addView(etNombre)
+        if (evalActual.esExtra == 0) layout.addView(etValor)
+
+        AlertDialog.Builder(requireContext())
+            .setTitle("Editar evaluación")
+            .setView(layout)
+            .setPositiveButton("Guardar") { _, _ ->
+                val nuevoNombre = etNombre.text.toString().trim()
+                val nuevoValor = etValor.text.toString().toIntOrNull() ?: evalActual.valor
+                if (nuevoNombre.isNotEmpty()) {
+                    repository.actualizarNombreEvaluacion(nrc!!, codigoMateria, evalActual.id, nuevoNombre)
+                    if (evalActual.esExtra == 0 && nuevoValor != evalActual.valor) {
+                        database.child("seccion_detalles").child(nrc!!)
+                            .child("evaluaciones").child(evalActual.id)
+                            .child("valor").setValue(nuevoValor)
+                    }
+                    Toast.makeText(requireContext(), "Evaluación actualizada", Toast.LENGTH_SHORT).show()
+                }
+            }
+            .setNegativeButton("Cancelar", null)
+            .show()
     }
 
     override fun onDestroyView() {
@@ -1055,40 +1085,9 @@ class StudentListFragment : Fragment() {
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {}
 
-    fun tieneEvaluacionIndividualSeleccionada(): Boolean {
-        val seleccion = spinnerEvaluaciones.selectedItem?.toString() ?: return false
-        return seleccion != ACUMULADO_TEXT && evaluaciones.any { getEvalDisplayName(it) == seleccion && it.esExtra == 0 }
-    }
-
-    fun mostrarDialogoEditarNombreEvaluacion() {
-        val seleccion = spinnerEvaluaciones.selectedItem?.toString() ?: return
-        val evalActual = evaluaciones.find { getEvalDisplayName(it) == seleccion } ?: return
-
-        val etNombre = EditText(requireContext()).apply {
-            setText(evalActual.nombre)
-            setPadding(60, 40, 60, 40)
-        }
-
-        AlertDialog.Builder(requireContext())
-            .setTitle("Editar nombre de evaluación")
-            .setView(etNombre)
-            .setPositiveButton("Guardar") { _, _ ->
-                val nuevoNombre = etNombre.text.toString().trim()
-                if (nuevoNombre.isNotEmpty()) {
-                    repository.actualizarNombreEvaluacion(nrc!!, codigoMateria, evalActual.id, nuevoNombre)
-                    Toast.makeText(requireContext(), "Nombre actualizado", Toast.LENGTH_SHORT).show()
-                }
-            }
-            .setNegativeButton("Cancelar", null)
-            .show()
-    }
-
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
         outState.putString("currentQuery", currentQuery)
-        
-        val seleccion = spinnerEvaluaciones.selectedItem?.toString()
-        val evalActual = evaluaciones.find { getEvalDisplayName(it) == seleccion }
-        outState.putString("selectedEvalId", evalActual?.id)
+        outState.putString("selectedEvalId", selectedEvalId)
     }
 }
